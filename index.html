@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>牛顿环实验测量工具</title>
+    <style>
+        /* Vue v-cloak: 避免模板闪烁 */
+        [v-cloak] { display: none; }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Microsoft YaHei', Arial, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px; transition: all 0.3s ease; overflow: hidden scroll }
+        body.drag-over::before { content: ''; position: fixed; inset: 0; z-index: 9999; background: rgba(0, 0, 0, 0.32); }
+        body.drag-over::after { content: '📥 释放以上传图片'; position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(255, 255, 255, 0.95); padding: 40px 60px; border-radius: 20px; font-size: 24px; color: #667eea; font-weight: bold; box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3); z-index: 9999; pointer-events: none; }
+
+        /* Layout */
+        .container { max-width: 1400px; margin: 0 auto; border-radius: 12px; box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2); overflow: hidden; }
+        .content { padding: 20px; display: flex; flex-direction: column; gap: 20px; background: white; }
+        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .grid-auto { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; }
+
+        /* Card Component */
+        .card { padding: 12px; background: #f8f9fa; border-radius: 8px; border: 1px solid #e0e0e0; }
+
+        /* Header */
+        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; text-align: center; }
+        .header h1 { font-size: 28px; margin-bottom: 10px; }
+        .header p { font-size: 14px; opacity: 0.9; }
+
+        /* Image Thumbnails */
+        .processed-images-list { display: flex; gap: 12px; overflow-x: auto; min-height: 140px; align-items: center; }
+        .image-thumbnail { flex-shrink: 0; width: 200px; cursor: pointer; border: 3px solid transparent; border-radius: 8px; overflow: visible; transition: all 0.3s ease; background: white; position: relative; }
+        .image-thumbnail:hover { transform: translateY(-5px); box-shadow: 0 5px 12px rgba(0, 0, 0, 0.2); }
+        .image-thumbnail.active { border-color: #667eea; }
+        .image-thumbnail img { width: 100%; height: 150px; object-fit: cover; display: block; }
+        .image-thumbnail-label { padding: 8px; font-size: 12px; text-align: center; color: #666; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .image-thumbnail:hover .image-thumbnail-delete { opacity: 1; }
+        .image-thumbnail-delete { position: absolute; top: -8px; right: -8px; width: 22px; height: 22px; background: rgba(255, 0, 0, 0.85); color: white; border: 2px solid white; border-radius: 50%; cursor: pointer; font-size: 18px; line-height: 18px; text-align: center; display: flex;align-items: center; justify-content: center; opacity: 0; transition: opacity 0.2s, transform 0.2s; z-index: 10; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3); }
+        .image-thumbnail-delete:hover { background: rgba(255, 0, 0, 1); transform: scale(1.15); }
+
+        /* Status & Progress Log */
+        .status-progress-container { min-height: 128px; overflow-y: auto; max-height: 128px; }
+        .log-entry { padding: 4px 8px; margin-bottom: 4px; border-radius: 4px; font-size: 13px; font-family: 'Consolas', monospace; }
+        .log-success { background: #d4edda; color: #155724; }
+        .log-error { background: #f8d7da; color: #721c24; }
+        .log-info { background: #d1ecf1; color: #0c5460; }
+
+        /* Image Display */
+        .image-box h3 { margin-bottom: 10px; color: #333; font-size: 16px; }
+        .image-wrapper { position: relative; border: 1px solid #ddd; border-radius: 4px; overflow: hidden; }
+        .image-box canvas,
+        .image-box img { width: 100%; height: auto; display: block; min-height: 300px; }
+
+        /* 预览滤镜效果 */
+        .preview-filter { transition: filter 0.2s ease; }
+
+        /* Upload Overlay */
+        .upload-overlay { position: absolute; inset: 20px;; border: 2px dashed #667eea; border-radius: 8px; display: flex; flex-direction: column; align-items: center; justify-content: center; cursor: pointer; transition: all 0.3s ease; background: rgba(102, 126, 234, 0.05); }
+        .upload-overlay:hover { background: rgba(102, 126, 234, 0.1); border-color: #764ba2; }
+        .upload-icon { font-size: 48px; margin-bottom: 16px; opacity: 0.6; }
+        .upload-text { font-size: 16px; color: #667eea; font-weight: bold; margin-bottom: 8px; }
+        .upload-hint { font-size: 13px; color: #999; }
+        .upload-overlay.hidden { display: none; }
+
+        /* Results Section */
+        .section-title { color: #333; margin-bottom: 20px; font-size: 22px; border-left: 4px solid #667eea; padding-left: 12px; }
+        .table-container { padding: 0; overflow-x: auto; }
+        .table-container table { table-layout: fixed; width: 100%; border-collapse: collapse; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1); }
+        .table-container thead { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
+        .table-container tbody { background: #f8f9fa; }
+        .table-container th, td { padding: 8px 12px; text-align: center; border-bottom: 1px solid #e0e0e0; }
+        .table-container th { font-weight: bold; font-size: 14px; }
+        .table-container tbody tr.tr:hover,
+        .table-container tbody tr.tr.hovered { background: rgba(102, 126, 234, 0.15); font-weight: bold; }
+        .table-container tbody tr:last-child td { border-bottom: none; }
+
+        /* Control Panel */
+        .control-panel { padding: 0; }
+        .control-group label { display: block; font-weight: bold; margin-bottom: 10px; color: #333; }
+        .control-group input[type="file"], .control-group input[type="number"] { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }
+        .drag-hint { text-align: center; color: #667eea; font-size: 13px; margin-top: 8px; opacity: 0.7; }
+
+        /* Buttons */
+        .btn { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; padding: 12px 20px; border-radius: 6px; cursor: pointer; font-size: 16px; font-weight: bold; width: 100%; margin-top: 10px; transition: transform 0.2s, box-shadow 0.2s; }
+        .btn:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 5px 12px rgba(102, 126, 234, 0.4); }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-export { background: linear-gradient(135deg, #38ef7d 0%, #11998e 100%); }
+        .export-buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+
+        /* Average Radius Card */
+        .avg-radius-card { margin-top: 20px; border-left: 4px solid #667eea; }
+        .avg-radius-card h3 { color: #333; margin-bottom: 10px; }
+        .avg-radius-card p { font-size: 18px; color: #667eea; font-weight: bold; }
+
+        /* Responsive */
+        @media (max-width: 768px) { .grid-2 { grid-template-columns: 1fr; } .grid-auto { grid-template-columns: 1fr; } }
+    </style>
+
+    <!-- SVG Filters for Preview -->
+    <svg style="position: absolute; width: 0; height: 0; overflow: hidden;">
+        <defs>
+            <!-- 锐化滤镜 -->
+            <filter id="sharpenFilter">
+                <feConvolveMatrix
+                    id="sharpenMatrix"
+                    order="3"
+                    kernelMatrix="0 -1 0 -1 5 -1 0 -1 0"
+                    preserveAlpha="true"
+                />
+            </filter>
+
+            <!-- 边缘增强滤镜 -->
+            <filter id="edgeEnhanceFilter">
+                <feConvolveMatrix
+                    id="edgeEnhanceMatrix"
+                    order="3"
+                    kernelMatrix="1 1 1 1 1 1 -1 -1 -1"
+                    preserveAlpha="true"
+                />
+            </filter>
+
+            <!-- 浮雕滤镜 -->
+            <filter id="embossFilter">
+                <feConvolveMatrix
+                    id="embossMatrix"
+                    order="3"
+                    kernelMatrix="-2 -1 0 -1 1 1 0 1 2"
+                    preserveAlpha="true"
+                />
+            </filter>
+        </defs>
+    </svg>
+</head>
+<body>
+    <div id="app" v-cloak>
+        <div class="container">
+            <!-- Header -->
+            <div class="header">
+                <h1>🔬 牛顿环实验测量工具 V1.0.0</h1>
+                <p>基于 OpenCV 的自动图像识别与曲率半径计算系统</p>
+            </div>
+
+            <div class="content">
+                <!-- Image Thumbnails -->
+                <div class="processed-images-list card" v-if="processedImages.length > 0">
+                    <div
+                        v-for="img in processedImages"
+                        :key="img.fingerprint"
+                        class="image-thumbnail"
+                        :class="{ active: currentFingerprint === img.fingerprint }"
+                        @click="switchToImage(img.fingerprint)"
+                        @dragstart.prevent
+                    >
+                        <button
+                            class="image-thumbnail-delete"
+                            @click.stop="removeFromProcessedList(img.fingerprint)"
+                            title="删除此图片"
+                        >×</button>
+                        <div class="image-wrapper"><img :src="img.imageDataUrl" :alt="img.fileName" :title="img.fileName" draggable="false"></div>
+                        <div class="image-thumbnail-label">{{ img.fileName }}</div>
+                    </div>
+                </div>
+                <!-- Status & Progress Log -->
+                <div class="status-progress-container card" ref="logContainerRef">
+                    <div v-for="(log, index) in logs" :key="index" :class="['log-entry', `log-${log.type}`]">{{ log.message }}</div>
+                </div>
+
+                <!-- Image Display -->
+                <div class="image-container grid-2">
+                    <div class="image-box card">
+                        <h3>原始图像</h3>
+                        <div class="image-wrapper">
+                            <img ref="originalImageRef" :src="originalImageSrc" alt="" >
+                            <div
+                                class="upload-overlay"
+                                :class="{ hidden: uploadedImage }"
+                                @click="fileInputRef.click()"
+                            >
+                                <div class="upload-icon">📷</div>
+                                <div class="upload-text">点击或拖拽上传牛顿环图像</div>
+                                <div class="upload-hint">支持 JPG, PNG, WEBP 等格式</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="image-box card">
+                        <h3>识别结果 {{originalImageRef?.naturalWidth}}x{{originalImageRef?.naturalHeight}}px</h3>
+                        <div class="image-wrapper">
+                            <img ref="resultImageRef" :src="resultImageSrc" class="preview-filter" :style="{ filter: previewFilterStyle }" alt="">
+                            <canvas ref="resultCanvasRef" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;"></canvas>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Control Panel -->
+                <div class="control-panel grid-auto" v-if="uploadedImage">
+                    <!-- 图像预处理调试面板 -->
+                    <div class="control-group card" style="grid-column: 1 / -1;">
+                        <label style="display: flex; justify-content: space-between; align-items: center;">
+                            <span> 图像预处理参数调试</span>
+                            <button style="padding: 4px 12px; font-size: 12px; cursor: pointer; background: #667eea; color: white; border: none; border-radius: 4px;" @click="resetFilterParams" >重置参数</button>
+                        </label>
+                        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-top: 10px;">
+                            <!-- 亮度 -->
+                            <label style="font-size: 12px; color: #666;">
+                                亮度 (Brightness): {{ filterParams.brightness }}
+                                <input type="range" v-model.number="filterParams.brightness" min="0.5" max="2" step="0.1" style="width: 100%;" @input="updatePreviewFilter">
+                            </label>
+                            <!-- 对比度 -->
+                            <label style="font-size: 12px; color: #666;">
+                                对比度 (Contrast): {{ filterParams.contrast }}
+                                <input type="range" v-model.number="filterParams.contrast" min="0.5" max="3" step="0.1" style="width: 100%;" @input="updatePreviewFilter">
+                            </label>
+                            <!-- 模糊 -->
+                            <label style="font-size: 12px; color: #666;">
+                                模糊 (Blur): {{ filterParams.blur }}px
+                                <input type="range" v-model.number="filterParams.blur" min="0" max="5" step="1" style="width: 100%;" @input="updatePreviewFilter">
+                            </label>
+                            <!-- 灰度 -->
+                            <label style="font-size: 12px; color: #666;">
+                                灰度 (Grayscale): {{ filterParams.grayscale }}%
+                                <input type="range" v-model.number="filterParams.grayscale" min="0" max="100" step="10" style="width: 100%;" @input="updatePreviewFilter">
+                            </label>
+                            <!-- 锐化 -->
+                            <label style="font-size: 12px; color: #666;">
+                                锐化 (Sharpen): {{ filterParams.sharpen }}
+                                <input type="range" v-model.number="filterParams.sharpen" min="0" max="3" step="0.5" style="width: 100%;" @input="updatePreviewFilter">
+                            </label>
+                            <!-- 边缘增强 -->
+                            <label style="font-size: 12px; color: #666;">
+                                边缘增强 (Edge): {{ filterParams.edgeEnhance }}
+                                <input type="range" v-model.number="filterParams.edgeEnhance" min="0" max="2" step="0.1" style="width: 100%;" @input="updatePreviewFilter">
+                            </label>
+                            <!-- CLAHE对比度限制 -->
+                            <label style="font-size: 12px; color: #666;">
+                                CLAHE Clip: {{ filterParams.claheClip }}
+                                <input type="range" v-model.number="filterParams.claheClip" min="1" max="5" step="0.5" style="width: 100%;" @input="updatePreviewFilter">
+                            </label>
+                            <!-- CLAHE网格大小 -->
+                            <label style="font-size: 12px; color: #666;">
+                                CLAHE Tile: {{ filterParams.claheTile }}
+                                <input type="range" v-model.number="filterParams.claheTile" min="4" max="16" step="2" style="width: 100%;" @input="updatePreviewFilter">
+                            </label>
+                        </div>
+
+                        <div style="margin-top: 10px; padding: 8px; background: #f0f0f0; border-radius: 4px; font-size: 12px; color: #666;">
+                            💡 提示: 调整参数后点击“重新处理”应用OpenCV同等转换
+                        </div>
+                    </div>
+                    <!-- 像素标定 -->
+                    <div class="control-group card">
+                        <label>像素标定值 (mm/像素)</label>
+                        <input
+                            type="number"
+                            v-model.number="pixelScale"
+                            step="0.0001"
+                            min="0.0001"
+                        >
+                        <small style="color: #666; display: block; margin-top: 5px;">
+                            默认: 1像素 = 0.005毫米
+                        </small>
+                    </div>
+                    <!-- 处理按钮 -->
+                    <div class="control-group card">
+                        <button
+                            class="btn"
+                            @click="processImage"
+                            :disabled="!cvReady || isProcessing"
+                        >
+                            {{ isProcessing ? '处理中...' : '重新处理' }}
+                        </button>
+                        <p class="drag-hint">💡 修改参数后点击重新处理</p>
+                    </div>
+                </div>
+
+                <!-- Results Section -->
+                <div class="results-section">
+                    <h2 class="section-title">📊 测量结果</h2>
+
+                    <!-- Diameter Table -->
+                    <h3 style="margin: 20px 0 10px 0; color: #555;">表1: 各暗环直径测量数据</h3>
+                    <div class="table-container card">
+                        <table>
+                            <thead><tr><th>环编号 (k)</th><th>直径 (像素)</th><th>直径 (mm)</th></tr></thead>
+                            <tbody>
+                                <tr v-if="diameterData.length === 0"><td colspan="3" style="padding: 40px;">📷 暂无测量数据，请上传图片并等待自动处理</td></tr>
+                                <tr v-for="item in diameterData" :key="item.number"
+                                    class="tr"
+                                    :class="{ hovered: hoveredRing === item.number }"
+                                    @mouseenter="onTableRowHover(item.number)"
+                                    @mouseleave="onTableRowLeave()">
+                                    <td>{{ item.number }}</td>
+                                    <td>{{ item.diameterPixel.toFixed(2) }}</td>
+                                    <td>{{ item.diameterMM.toFixed(3) }}</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <!-- Radius Table -->
+                    <h3 style="margin: 20px 0 10px 0; color: #555;">表2: 曲率半径计算结果</h3>
+                    <div class="table-container card">
+                        <table>
+                            <thead><tr><th>分组</th><th>m</th><th>n</th><th>D<sub>m</sub>² - D<sub>n</sub>² (mm²)</th><th>曲率半径 R (m)</th></tr></thead>
+                            <tbody>
+                                <tr v-if="radiusData.length === 0"><td colspan="5" style="padding: 40px;">📊 暂无计算结果</td></tr>
+                                <tr v-for="item in radiusData" :key="item.group" class="tr">
+                                    <td>{{ item.group }}</td>
+                                    <td>{{ item.m }}</td>
+                                    <td>{{ item.n }}</td>
+                                    <td>{{ item.diffSquared.toFixed(3) }}</td>
+                                    <td>{{ item.radius.toFixed(3) }}</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <!-- Average Radius -->
+                    <div class="avg-radius-card card">
+                        <h3>📈 平均曲率半径</h3>
+                        <p>
+                            {{ averageRadius > 0 ? averageRadius.toFixed(3) + ' m' : '-' }}
+                        </p>
+                    </div>
+                </div>
+
+                <!-- Export Buttons -->
+                <div class="control-panel" v-if="calculationResults">
+                    <div class="control-group card" style="grid-column: 1 / -1;">
+                        <label>📥 导出结果</label>
+                        <div class="export-buttons">
+                            <button class="btn btn-export" @click="exportCSV">导出 CSV 数据</button>
+                            <button class="btn btn-export" @click="exportImage">导出识别截图</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Hidden File Input -->
+                <input type="file" ref="fileInputRef" accept="image/*" @change="handleFileUpload" style="display: none;">
+            </div>
+        </div>
+    </div>
+
+    <script src="js/lib/vue.global.js"></script>
+    <script src="js/lib/opencv.js" async></script>
+    <script type="module" src="js/main.js"></script>
+</body>
+</html>
