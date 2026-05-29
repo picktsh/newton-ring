@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>README - 牛顿环实验测量工具</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Microsoft YaHei', Arial, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 20px; }
+        .container { max-width: 1400px; margin: 0 auto; background: white; border-radius: 12px; box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2); overflow: hidden; }
+        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; text-align: center; }
+        .header h1 { font-size: 24px; margin-bottom: 10px; }
+        .nav-bar { background: #f8f9fa; padding: 15px 20px; border-bottom: 1px solid #e0e0e0; display: flex; justify-content: space-between; align-items: center; }
+        .back-link { color: #667eea; text-decoration: none; font-weight: bold; display: inline-flex; align-items: center; gap: 5px; transition: color 0.2s; }
+        .back-link:hover { color: #764ba2; }
+        .content { padding: 30px; line-height: 1.8; color: #333; }
+        .content h1 { color: #667eea; font-size: 28px; margin: 30px 0 20px 0; padding-bottom: 10px; border-bottom: 2px solid #667eea; }
+        .content h2 { color: #764ba2; font-size: 24px; margin: 25px 0 15px 0; }
+        .content h3 { color: #555; font-size: 20px; margin: 20px 0 10px 0; }
+        .content p { margin: 10px 0; }
+        .content ul, .content ol { margin: 10px 0 10px 20px; }
+        .content li { margin: 5px 0; }
+        .content code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-family: 'Consolas', monospace; font-size: 14px; color: #e83e8c; }
+        .content pre { background: #2d2d2d; color: #f8f8f2; padding: 15px; border-radius: 6px; overflow-x: auto; margin: 15px 0; }
+        .content pre code { background: transparent; color: inherit; padding: 0; }
+        .content table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+        .content th, .content td { border: 1px solid #ddd; padding: 10px; text-align: left; }
+        .content th { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; font-weight: bold; }
+        .content tr:nth-child(even) { background: #f8f9fa; }
+        .content blockquote { border-left: 4px solid #667eea; padding: 10px 20px; margin: 15px 0; background: #f0f4ff; color: #555; }
+        .content strong { color: #667eea; }
+        .content hr { border: none; height: 2px; background: linear-gradient(90deg, transparent, #667eea, transparent); margin: 30px 0; }
+        @media (max-width: 768px) { .content { padding: 20px; } .content h1 { font-size: 24px; } .content h2 { font-size: 20px; } }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📖 项目文档</h1>
+        </div>
+
+        <div class="nav-bar">
+            <a href="index.html" class="back-link">← 返回主程序</a>
+            <span style="color: #666; font-size: 14px;">README.md</span>
+        </div>
+
+        <div class="content" id="readme-content">
+            <!-- Markdown 内容将通过 JavaScript 加载 -->
+        </div>
+    </div>
+
+    <script src="js/lib/marked.min.js"></script>
+    <script>
+        // 加载 README.md 文件
+        async function loadReadme() {
+            try {
+                const response = await fetch('README.md');
+                if (!response.ok) {
+                    throw new Error('无法加载 README.md 文件');
+                }
+                const markdown = await response.text();
+                const html = marked.parse(markdown);
+                document.getElementById('readme-content').innerHTML = html;
+            } catch (error) {
+                console.error('加载 README 失败:', error);
+                document.getElementById('readme-content').innerHTML =
+                    '<div style="text-align: center; padding: 40px; color: #999;">' +
+                    '<h2>⚠️ 无法加载 README.md</h2>' +
+                    '<p>请确保 README.md 文件与 readme.html 在同一目录下</p>' +
+                    '<p style="margin-top: 20px;"><a href="index.html" style="color: #667eea;">返回主程序</a></p>' +
+                    '</div>';
+            }
+        }
+
+        // 页面加载完成后执行
+        window.addEventListener('DOMContentLoaded', loadReadme);
+    </script>
+</body>
+</html>
