@@ -6,3 +6,10 @@ node_modules
 build
 dist
 coverage
+
+# wrangler files
+.wrangler
+.dev.vars*
+!.dev.vars.example
+.env*
+!.env.example
