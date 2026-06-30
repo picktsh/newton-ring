@@ -50,19 +50,20 @@ export function calculateRadiusData(detectedRings, pixelScale) {
     return results;
 }
 
-// 动态生成分组配置 (保证 m-n 的差值足够大)
+// 动态生成分组配置 (固定差值为3)
 function generateDynamicGroups(maxRingNumber) {
-    if (maxRingNumber < 5) {
+    if (maxRingNumber < 4) {
         return [];
     }
     const groups = [];
-    // 步长至少为3，确保足够的差值
-    const step = Math.max(3, Math.floor(maxRingNumber / 5));
-    for (let i = 0; i < 5; i++) {
-        const m = maxRingNumber - i * 2;
-        const n = Math.max(1, m - step);
-        if (m > n && m <= maxRingNumber && n >= 1) {
+    // 固定差值为3
+    const step = 3;
+    for (let m = maxRingNumber; m >= 4; m--) {
+        const n = m - step;
+        if (n >= 1) {
             groups.push({ m, n });
+            // 最多生成5组
+            // if (groups.length >= 5) break;
         }
     }
     return groups;
