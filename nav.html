@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>物理实验仿真平台</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: 'Microsoft YaHei', system-ui, sans-serif;
+        }
+        .container {
+            text-align: center;
+            padding: 40px 20px;
+        }
+        h1 {
+            color: #fff;
+            font-size: 2.2rem;
+            margin-bottom: 12px;
+            text-shadow: 0 2px 8px rgba(0,0,0,0.2);
+        }
+        .subtitle {
+            color: rgba(255,255,255,0.8);
+            font-size: 1rem;
+            margin-bottom: 48px;
+        }
+        .cards {
+            display: flex;
+            gap: 32px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        .card {
+            background: #fff;
+            border-radius: 20px;
+            padding: 40px 36px;
+            width: 280px;
+            text-decoration: none;
+            color: #333;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.15);
+            transition: transform 0.3s, box-shadow 0.3s;
+            display: block;
+        }
+        .card:hover {
+            transform: translateY(-8px);
+            box-shadow: 0 20px 60px rgba(0,0,0,0.25);
+        }
+        .card-icon {
+            font-size: 3rem;
+            margin-bottom: 16px;
+        }
+        .card-title {
+            font-size: 1.3rem;
+            font-weight: 700;
+            margin-bottom: 10px;
+            color: #333;
+        }
+        .card-desc {
+            font-size: 0.9rem;
+            color: #888;
+            line-height: 1.6;
+        }
+        .card-tag {
+            display: inline-block;
+            margin-top: 16px;
+            padding: 4px 14px;
+            border-radius: 20px;
+            font-size: 0.75rem;
+            font-weight: 600;
+        }
+        .card:nth-child(1) .card-tag { background: #e8f0fe; color: #667eea; }
+        .card:nth-child(2) .card-tag { background: #fde8e8; color: #e74c3c; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>物理实验仿真平台</h1>
+        <p class="subtitle">选择实验项目开始探索</p>
+        <div class="cards">
+            <a class="card" href="index.html">
+                <div class="card-icon">🔬</div>
+                <div class="card-title">牛顿环实验</div>
+                <div class="card-desc">光的等厚干涉现象仿真，测量透镜曲率半径</div>
+                <span class="card-tag">光学实验</span>
+            </a>
+            <a class="card" href="rlc.html">
+                <div class="card-icon">⚡</div>
+                <div class="card-title">RLC 串联谐振</div>
+                <div class="card-desc">RLC电路频率特性分析，李萨如图形观测</div>
+                <span class="card-tag">电路实验</span>
+            </a>
+        </div>
+    </div>
+</body>
+</html>
