@@ -273,7 +273,7 @@
     <div class="section-title">📊 实测数据输入</div>
     <div class="paste-section">
       <textarea id="pasteArea" placeholder="200 10&#10;500 35&#10;700 48&#10;796 50&#10;900 45&#10;1200 25"></textarea>
-      <div class="paste-hint">格式示例：频率(Hz) 电流(mA)，每行一组数据</div>
+      <div class="paste-hint">格式示例：频率(kHz) 电流(mA)，每行一组数据</div>
       <button class="btn btn-primary" onclick="parsePasteData()" style="margin-top: 8px;">解析并导入</button>
     </div>
     <table class="data-table" id="measuredDataTable"><thead><tr><th>序号</th><th>频率 (Hz)</th><th>电流 (mA)</th><th>操作</th></tr></thead><tbody></tbody></table>
@@ -304,18 +304,27 @@
     <div class="section-title">📐 李萨如图形分析</div>
     <div class="lissa-canvas-row">
       <div class="lissa-scope-panel">
-        <div class="lissa-panel-title">示波器 · 李萨如图 (X=Us, Y=Ur) <span class="lissa-tag">X-Y MODE</span></div>
+        <div class="lissa-panel-title">示波器 · 李萨如图 (X=激励电压 Y=电阻电压) <span class="lissa-tag">X-Y MODE</span></div>
         <canvas class="lissa-canvas" id="lissaScopeCanvas" height="420"></canvas>
         <div class="lissa-cursor-info" id="lissaCursorInfo"></div>
       </div>
       <div class="lissa-amp-panel">
         <div class="lissa-panel-title">幅频特性曲线 f-I <span class="lissa-tag" id="lissaResTag">f₀=--</span></div>
+                  <div style="display:flex;gap:8px;align-items:center;padding:2px 14px 6px;font-size:0.75rem;color:#666;flex-wrap:wrap;">
+          <span>横坐标:</span>
+          <input type="number" id="lissaFreqMin" value="" placeholder="最小" style="width:65px;padding:3px 6px;border:1px solid #ddd;border-radius:4px;font-size:0.75rem;">
+          <span>~</span>
+          <input type="number" id="lissaFreqMax" value="" placeholder="最大" style="width:65px;padding:3px 6px;border:1px solid #ddd;border-radius:4px;font-size:0.75rem;">
+          <span>Hz</span>
+          <button onclick="lissaApplyFreqRange()" style="padding:3px 10px;border:1px solid #667eea;background:#667eea;color:#fff;border-radius:4px;cursor:pointer;font-size:0.7rem;">应用</button>
+        </div>
+
         <canvas class="lissa-canvas" id="lissaAmpCanvas" height="420"></canvas>
       </div>
     </div>
     <div class="lissa-measure-bar">
-      <div class="lissa-measure-card"><div class="lissa-mlabel">Ur 峰峰值 (Vpp)</div><div class="lissa-mval lissa-cyan" id="lissaMUrpp">--</div></div>
-      <div class="lissa-measure-card"><div class="lissa-mlabel">Ur 有效值 (Vrms)</div><div class="lissa-mval lissa-green" id="lissaMUr">--</div></div>
+      <div class="lissa-measure-card"><div class="lissa-mlabel">电阻电压 峰峰值 (Vpp)</div><div class="lissa-mval lissa-cyan" id="lissaMUrpp">--</div></div>
+      <div class="lissa-measure-card"><div class="lissa-mlabel">电阻电压 有效值 (Vrms)</div><div class="lissa-mval lissa-green" id="lissaMUr">--</div></div>
       <div class="lissa-measure-card"><div class="lissa-mlabel">回路电流 I (mA)</div><div class="lissa-mval lissa-yellow" id="lissaMI">--</div></div>
       <div class="lissa-measure-card"><div class="lissa-mlabel">阻抗 |Z| (Ω)</div><div class="lissa-mval lissa-cyan" id="lissaMZ">--</div></div>
       <div class="lissa-measure-card"><div class="lissa-mlabel">相位 φ (°)</div><div class="lissa-mval lissa-red" id="lissaMPhi">--</div></div>
@@ -347,7 +356,7 @@
     <button class="btn btn-primary" onclick="runFrequencySweep()">开始频率扫描</button>
     <button class="btn btn-secondary" onclick="clearSweepResults()" style="margin-left: 10px;">清除结果</button>
     <div style="max-height: 200px; overflow-y: auto; margin-top: 12px;">
-      <table class="data-table" id="sweepTable"><thead><tr><th>序号</th><th>频率 (Hz)</th><th>电流 (mA)</th><th>相位 (°)</th><th>状态</th></tr></thead><tbody id="sweepTableBody"></tbody></table>
+      <table class="data-table" id="sweepTable"><thead><tr><th>序号</th><th>频率 (kHz)</th><th>电流 (mA)</th><th>相位 (°)</th><th>状态</th></tr></thead><tbody id="sweepTableBody"></tbody></table>
     </div>
   </div>
 
@@ -374,7 +383,7 @@
     var _lissaAnimFrame = 0;
     var _lissaLastAmpDraw = 0;
     var _lissaSweeping = false;
-    var _lissaAmpFixedRange = null;
+    var _lissaAmpFixedRange = { fMin: 1100, fMax: 3200 };
     var SAMPLE_COUNT = 500;
     var selectedComponentIndex = null;
     var wireIntermediatePoints = [];
@@ -418,12 +427,12 @@
         var Imax = V / R * 1000;
         var halfPower = Imax * 0.707;
         var f1 = fr - BW / 2, f2 = fr + BW / 2;
-        document.getElementById('resonantFreq').textContent = fr.toFixed(2);
-        document.getElementById('qualityFactor').textContent = Q.toFixed(2);
-        document.getElementById('bandwidth').textContent = BW.toFixed(2);
-        document.getElementById('maxCurrent').textContent = Imax.toFixed(2);
-        document.getElementById('halfPowerCurrent').textContent = halfPower.toFixed(2);
-        document.getElementById('cutoffFreqs').textContent = f1.toFixed(2) + ' / ' + f2.toFixed(2);
+        document.getElementById('resonantFreq').textContent = fr.toFixed(4);
+        document.getElementById('qualityFactor').textContent = Q.toFixed(4);
+        document.getElementById('bandwidth').textContent = BW.toFixed(4);
+        document.getElementById('maxCurrent').textContent = Imax.toFixed(4);
+        document.getElementById('halfPowerCurrent').textContent = halfPower.toFixed(4);
+        document.getElementById('cutoffFreqs').textContent = f1.toFixed(4) + ' / ' + f2.toFixed(4);
         return { fr: fr, Q: Q, BW: BW, Imax: Imax, halfPower: halfPower, omega0: omega0, f1: f1, f2: f2 };
     }
 
@@ -449,6 +458,9 @@
         document.getElementById('pasteArea').value = '';
         document.getElementById('measuredDataTable').getElementsByTagName('tbody')[0].innerHTML = '';
         document.getElementById('sweepTableBody').innerHTML = '';
+                document.getElementById('lissaFreqMin').value = '';
+        document.getElementById('lissaFreqMax').value = '';
+
         document.getElementById('componentEditor').style.display = 'none';
         measuredData = []; sweepResults = []; lissaAcquiredData = [];
         drawCircuitBoard(); calculateResults(); drawChart();
@@ -553,10 +565,10 @@
             var resY = padding.top + height*(1-theory.Imax/maxI);
             ctx.fillStyle = '#667eea'; ctx.beginPath(); ctx.arc(resX, resY, 6, 0, 2*Math.PI); ctx.fill();
             ctx.fillStyle = '#667eea'; ctx.font = 'bold 11px Microsoft YaHei';
-            ctx.fillText('Imax=' + theory.Imax.toFixed(1) + 'mA', resX-35, resY-10);
+            ctx.fillText('Imax=' + theory.Imax.toFixed(4) + 'mA', resX-35, resY-10);
 
             ctx.fillStyle = '#ff6b6b'; ctx.font = '10px Microsoft YaHei';
-            ctx.fillText('0.707×Imax=' + theory.halfPower.toFixed(1) + 'mA', padding.left+5, halfPowerY-5);
+            ctx.fillText('0.707×Imax=' + theory.halfPower.toFixed(4) + 'mA', padding.left+5, halfPowerY-5);
 
             var f1x = padding.left + (theory.f1-fStart)/(fEnd-fStart)*width;
             var f2x = padding.left + (theory.f2-fStart)/(fEnd-fStart)*width;
@@ -565,18 +577,18 @@
             ctx.fillStyle = '#dc3545'; ctx.beginPath(); ctx.arc(f2x, halfPowerY, 6, 0, 2*Math.PI); ctx.fill();
 
             ctx.fillStyle = '#dc3545'; ctx.font = 'bold 10px Microsoft YaHei';
-            ctx.fillText('f₁=' + theory.f1.toFixed(1) + 'Hz', f1x-35, halfPowerY+22);
-            ctx.fillText('f₂=' + theory.f2.toFixed(1) + 'Hz', f2x-35, halfPowerY+22);
+            ctx.fillText('f₁=' + theory.f1.toFixed(4) + 'Hz', f1x-35, halfPowerY+22);
+            ctx.fillText('f₂=' + theory.f2.toFixed(4) + 'Hz', f2x-35, halfPowerY+22);
 
             ctx.fillStyle = '#dc3545'; ctx.font = '9px Microsoft YaHei';
-            ctx.fillText('I=' + theory.halfPower.toFixed(2) + 'mA', f1x-25, halfPowerY-8);
-            ctx.fillText('I=' + theory.halfPower.toFixed(2) + 'mA', f2x-25, halfPowerY-8);
+            ctx.fillText('I=' + theory.halfPower.toFixed(4) + 'mA', f1x-25, halfPowerY-8);
+            ctx.fillText('I=' + theory.halfPower.toFixed(4) + 'mA', f2x-25, halfPowerY-8);
 
             ctx.strokeStyle = '#dc3545'; ctx.lineWidth = 2;
             ctx.beginPath(); ctx.moveTo(f1x, halfPowerY); ctx.lineTo(f2x, halfPowerY); ctx.stroke();
 
             ctx.fillStyle = '#dc3545'; ctx.font = 'bold 12px Microsoft YaHei';
-            ctx.fillText('BW=' + theory.BW.toFixed(1) + 'Hz', (f1x+f2x)/2-35, halfPowerY-18);
+            ctx.fillText('BW=' + theory.BW.toFixed(4) + 'Hz', (f1x+f2x)/2-35, halfPowerY-18);
 
             ctx.strokeStyle = '#dc3545'; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
             ctx.beginPath(); ctx.moveTo(f1x, halfPowerY); ctx.lineTo(f1x, H-padding.bottom+10); ctx.stroke();
@@ -613,9 +625,9 @@
             }
 
             ctx.fillStyle = '#666'; ctx.font = '11px Microsoft YaHei'; ctx.textAlign = 'center';
-            for (var i = 0; i <= 5; i++) { ctx.fillText((fStart+(fEnd-fStart)*(i/5)).toFixed(0), padding.left+(width/5)*i, H-20); }
+            for (var i = 0; i <= 5; i++) { ctx.fillText((fStart+(fEnd-fStart)*(i/5)).toFixed(4), padding.left+(width/5)*i, H-20); }
             ctx.textAlign = 'right';
-            for (var i = 0; i <= 5; i++) { ctx.fillText((maxI*(1-i/5)).toFixed(1), padding.left-8, padding.top+(height/5)*i+3); }
+            for (var i = 0; i <= 5; i++) { ctx.fillText((maxI*(1-i/5)).toFixed(4), padding.left-8, padding.top+(height/5)*i+3); }
             ctx.font = 'bold 13px Microsoft YaHei'; ctx.textAlign = 'center'; ctx.fillStyle = '#333';
             ctx.fillText('频率 f (Hz)', W/2, H-5);
             ctx.save(); ctx.translate(25, H/2); ctx.rotate(-Math.PI/2); ctx.fillText('电流 I (mA)', 0, 0); ctx.restore();
@@ -658,7 +670,7 @@
                         ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(px, py, 3, 0, 2*Math.PI); ctx.fill();
                         // 标签
                         ctx.fillStyle = refPhases[sp].color; ctx.font = 'bold 10px Microsoft YaHei'; ctx.textAlign = 'left';
-                        ctx.fillText(refPhases[sp].label + ' f=' + fCross.toFixed(1) + 'Hz', px + 10, py + 4);
+                        ctx.fillText(refPhases[sp].label + ' f=' + fCross.toFixed(4) + 'Hz', px + 10, py + 4);
                         found = true;
                     }
                 }
@@ -681,19 +693,19 @@
                     ctx.fillStyle = '#28a745'; ctx.beginPath(); ctx.arc(zx, zeroY, 7, 0, 2*Math.PI); ctx.fill();
                     ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(zx, zeroY, 3.5, 0, 2*Math.PI); ctx.fill();
                     ctx.fillStyle = '#28a745'; ctx.font = 'bold 11px Microsoft YaHei'; ctx.textAlign = 'left';
-                    ctx.fillText('φ=0° f=' + fZero.toFixed(1) + 'Hz', zx + 12, zeroY - 8);
+                    ctx.fillText('φ=0° f=' + fZero.toFixed(4) + 'Hz', zx + 12, zeroY - 8);
                     zeroFound = true;
                 }
             }
 
             ctx.fillStyle = '#666'; ctx.font = '11px Microsoft YaHei'; ctx.textAlign = 'center';
-            for (var i = 0; i <= 5; i++) { ctx.fillText((fStart+(fEnd-fStart)*(i/5)).toFixed(0), padding.left+(width/5)*i, H-20); }
+            for (var i = 0; i <= 5; i++) { ctx.fillText((fStart+(fEnd-fStart)*(i/5)).toFixed(4), padding.left+(width/5)*i, H-20); }
             // Y轴刻度按相位映射定位（-90°,-45°,0°,45°,90°），确保0°与纵坐标中心对齐
             ctx.textAlign = 'right';
             var phaseTicks = [-90, -45, 0, 45, 90];
             for (var i = 0; i < phaseTicks.length; i++) {
                 var tickY = padding.top + height*(1-(phaseTicks[i]+90)/180);
-                ctx.fillText(phaseTicks[i].toFixed(0), padding.left-8, tickY+3);
+                ctx.fillText(phaseTicks[i].toFixed(4), padding.left-8, tickY+3);
             }
             ctx.font = 'bold 13px Microsoft YaHei'; ctx.textAlign = 'center'; ctx.fillStyle = '#333';
             ctx.fillText('频率 f (Hz)', W/2, H-5);
@@ -726,9 +738,9 @@
             ctx.fillText('Zmin=' + R + 'Ω', resX-30, resY-12);
 
             ctx.fillStyle = '#666'; ctx.font = '11px Microsoft YaHei'; ctx.textAlign = 'center';
-            for (var i = 0; i <= 5; i++) { ctx.fillText((fStart+(fEnd-fStart)*(i/5)).toFixed(0), padding.left+(width/5)*i, H-20); }
+            for (var i = 0; i <= 5; i++) { ctx.fillText((fStart+(fEnd-fStart)*(i/5)).toFixed(4), padding.left+(width/5)*i, H-20); }
             ctx.textAlign = 'right';
-            for (var i = 0; i <= 5; i++) { ctx.fillText((maxZ*(1-i/5)).toFixed(0), padding.left-8, padding.top+(height/5)*i+3); }
+            for (var i = 0; i <= 5; i++) { ctx.fillText((maxZ*(1-i/5)).toFixed(4), padding.left-8, padding.top+(height/5)*i+3); }
             ctx.font = 'bold 13px Microsoft YaHei'; ctx.textAlign = 'center'; ctx.fillStyle = '#333';
             ctx.fillText('频率 f (Hz)', W/2, H-5);
             ctx.save(); ctx.translate(25, H/2); ctx.rotate(-Math.PI/2); ctx.fillText('|Z(f)| (Ω)', 0, 0); ctx.restore();
@@ -778,7 +790,7 @@
                 }
                 if (Math.sqrt(Math.pow(clickX - mdX, 2) + Math.pow(clickY - mdY, 2)) < 12) {
                     var tooltip = document.getElementById('chartTooltip');
-                    tooltip.innerHTML = '📗 实测数据<br>频率: ' + md.freq.toFixed(2) + ' Hz<br>电流: ' + md.current.toFixed(2) + ' mA';
+                    tooltip.innerHTML = '📗 实测数据<br>频率: ' + md.freq.toFixed(4) + ' Hz<br>电流: ' + md.current.toFixed(4) + ' mA';
                     tooltip.style.left = (mdX + 10) + 'px'; tooltip.style.top = (mdY - 10) + 'px'; tooltip.style.display = 'block';
                     return;
                 }
@@ -801,9 +813,9 @@
         }
         var tooltip = document.getElementById('chartTooltip');
         var content = '';
-        if (currentChart === 'amp') content = '频率: ' + closestF.toFixed(2) + ' Hz<br>电流: ' + closestI.toFixed(2) + ' mA<br>阻抗: ' + closestZ.toFixed(1) + ' Ω';
-        else if (currentChart === 'phase') content = '频率: ' + closestF.toFixed(2) + ' Hz<br>相位差: ' + closestPhase.toFixed(2) + '°<br>感抗: ' + (2*Math.PI*closestF*L).toFixed(1) + ' Ω<br>容抗: ' + (1/(2*Math.PI*closestF*C)).toFixed(1) + ' Ω';
-        else content = '频率: ' + closestF.toFixed(2) + ' Hz<br>阻抗: ' + closestZ.toFixed(1) + ' Ω<br>电流: ' + closestI.toFixed(2) + ' mA';
+        if (currentChart === 'amp') content = '频率: ' + closestF.toFixed(4) + ' Hz<br>电流: ' + closestI.toFixed(4) + ' mA<br>阻抗: ' + closestZ.toFixed(4) + ' Ω';
+        else if (currentChart === 'phase') content = '频率: ' + closestF.toFixed(4) + ' Hz<br>相位差: ' + closestPhase.toFixed(4) + '°<br>感抗: ' + (2*Math.PI*closestF*L).toFixed(4) + ' Ω<br>容抗: ' + (1/(2*Math.PI*closestF*C)).toFixed(4) + ' Ω';
+        else content = '频率: ' + closestF.toFixed(4) + ' Hz<br>阻抗: ' + closestZ.toFixed(4) + ' Ω<br>电流: ' + closestI.toFixed(4) + ' mA';
         tooltip.innerHTML = content;
         tooltip.style.left = (clickX + 10) + 'px'; tooltip.style.top = (clickY - 10) + 'px'; tooltip.style.display = 'block';
     }
@@ -824,12 +836,12 @@
         var measuredFr = parseFloat(document.getElementById('measuredResonantFreq').value);
         var measuredBW = parseFloat(document.getElementById('measuredBandwidth').value);
         if (isNaN(measuredFr) || isNaN(measuredBW)) { alert('请输入完整的实测数据'); return; }
-        document.getElementById('theoryFr').textContent = theory.fr.toFixed(2);
-        document.getElementById('measFr').textContent = measuredFr.toFixed(2);
-        document.getElementById('freqRelError').textContent = (Math.abs(measuredFr-theory.fr)/theory.fr*100).toFixed(2) + '%';
-        document.getElementById('theoryBw').textContent = theory.BW.toFixed(2);
-        document.getElementById('measBw').textContent = measuredBW.toFixed(2);
-        document.getElementById('bwRelError').textContent = (Math.abs(measuredBW-theory.BW)/theory.BW*100).toFixed(2) + '%';
+        document.getElementById('theoryFr').textContent = theory.fr.toFixed(4);
+        document.getElementById('measFr').textContent = measuredFr.toFixed(4);
+        document.getElementById('freqRelError').textContent = (Math.abs(measuredFr-theory.fr)/theory.fr*100).toFixed(4) + '%';
+        document.getElementById('theoryBw').textContent = theory.BW.toFixed(4);
+        document.getElementById('measBw').textContent = measuredBW.toFixed(4);
+        document.getElementById('bwRelError').textContent = (Math.abs(measuredBW-theory.BW)/theory.BW*100).toFixed(4) + '%';
         document.getElementById('errorPanel').style.display = 'grid';
     }
 
@@ -839,7 +851,7 @@
         for (var i = 0; i < lines.length; i++) {
             var parts = lines[i].trim().split(/\s+/);
             if (parts.length >= 2) {
-                var freq = parseFloat(parts[0]), current = parseFloat(parts[1]);
+                var freq = parseFloat(parts[0]) * 1000, current = parseFloat(parts[1]);
                 if (!isNaN(freq) && !isNaN(current)) measuredData.push({ freq: freq, current: current });
             }
         }
@@ -849,7 +861,7 @@
     function updateDataTable() {
         var tbody = document.getElementById('measuredDataTable').getElementsByTagName('tbody')[0]; var html = '';
         for (var i = 0; i < measuredData.length; i++)
-            html += '<tr><td>' + (i+1) + '</td><td><input type="number" value="' + measuredData[i].freq + '"></td><td><input type="number" value="' + measuredData[i].current + '"></td><td><button onclick="deleteDataRow(this)" style="color:#dc3545;border:none;background:none;cursor:pointer;">删除</button></td></tr>';
+            html += '<tr><td>' + (i+1) + '</td><td><input type="number" value="' + (measuredData[i].freq/1000).toFixed(4) + '"></td><td><input type="number" value="' + measuredData[i].current + '"></td><td><button onclick="deleteDataRow(this)" style="color:#dc3545;border:none;background:none;cursor:pointer;">删除</button></td></tr>';
         tbody.innerHTML = html;
     }
     function addDataRow() { measuredData.push({ freq: 0, current: 0 }); updateDataTable(); }
@@ -857,7 +869,7 @@
     function plotMeasuredData() {
         var tbody = document.getElementById('measuredDataTable').getElementsByTagName('tbody')[0]; var newData = [];
         for (var i = 0; i < tbody.rows.length; i++) {
-            var freq = parseFloat(tbody.rows[i].cells[1].getElementsByTagName('input')[0].value);
+            var freq = parseFloat(tbody.rows[i].cells[1].getElementsByTagName('input')[0].value) * 1000;
             var current = parseFloat(tbody.rows[i].cells[2].getElementsByTagName('input')[0].value);
             if (!isNaN(freq) && !isNaN(current)) newData.push({ freq: freq, current: current });
         }
@@ -1082,12 +1094,12 @@
     }
     function lissaUpdateMeasure() {
         var info = lissaCalcMeasure();
-        document.getElementById('lissaMUrpp').textContent = info.Urpp.toFixed(3);
+        document.getElementById('lissaMUrpp').textContent = info.Urpp.toFixed(4);
         document.getElementById('lissaMUr').textContent = info.Ur.toFixed(4);
-        document.getElementById('lissaMI').textContent = info.I.toFixed(2);
-        document.getElementById('lissaMZ').textContent = info.z.Z.toFixed(1);
-        document.getElementById('lissaMPhi').textContent = info.z.phi.toFixed(1);
-        document.getElementById('lissaResTag').textContent = 'f\u2080=' + info.f0.toFixed(0) + ' Hz';
+        document.getElementById('lissaMI').textContent = info.I.toFixed(4);
+        document.getElementById('lissaMZ').textContent = info.z.Z.toFixed(4);
+        document.getElementById('lissaMPhi').textContent = info.z.phi.toFixed(4);
+        document.getElementById('lissaResTag').textContent = 'f\u2080=' + info.f0.toFixed(4) + ' Hz';
         return info;
     }
     function runFrequencySweep() {
@@ -1110,7 +1122,7 @@
         for (var i = 0; i < sweepResults.length; i++) {
             var item = sweepResults[i];
             var rowClass = item.type === '谐振' ? 'style="background:#e8f5e9;"' : (item.type === '感性' ? 'style="background:#fff3e0;"' : 'style="background:#e3f2fd;"');
-            html += '<tr ' + rowClass + '><td>' + (i+1) + '</td><td>' + item.freq.toFixed(2) + '</td><td>' + item.current.toFixed(2) + '</td><td>' + item.phase.toFixed(2) + '</td><td>' + item.type + '</td></tr>';
+            html += '<tr ' + rowClass + '><td>' + (i+1) + '</td><td>' + item.freq.toFixed(4) + '</td><td>' + item.current.toFixed(4) + '</td><td>' + item.phase.toFixed(4) + '</td><td>' + item.type + '</td></tr>';
         }
         tbody.innerHTML = html;
         measuredData = sweepResults.map(function(item) { return { freq: item.freq, current: item.current }; });
@@ -1154,7 +1166,7 @@
         }
         for (var i = 1; i < points.length; i++) {
             var alpha = 0.06 + 0.94 * (i / points.length);
-            ctx.strokeStyle = 'rgba(54,209,220,' + alpha.toFixed(2) + ')';
+            ctx.strokeStyle = 'rgba(54,209,220,' + alpha.toFixed(4) + ')';
             ctx.lineWidth = 1.2 + 1.5 * alpha;
             ctx.beginPath(); ctx.moveTo(points[i - 1].x, points[i - 1].y); ctx.lineTo(points[i].x, points[i].y); ctx.stroke();
         }
@@ -1170,8 +1182,8 @@
         ctx.beginPath(); ctx.moveTo(pad, curY); ctx.lineTo(pad + gW, curY); ctx.stroke();
         ctx.setLineDash([]);
         ctx.fillStyle = '#e74c3c'; ctx.beginPath(); ctx.arc(curX, curY, 5, 0, Math.PI * 2); ctx.fill();
-        var voltX = ((lissaScopeCursor.x - 0.5) * 2 * Xamp * 1.2).toFixed(2);
-        var voltY = (-(lissaScopeCursor.y - 0.5) * 2 * Yamp * 1.2).toFixed(2);
+        var voltX = ((lissaScopeCursor.x - 0.5) * 2 * Xamp * 1.2).toFixed(4);
+        var voltY = (-(lissaScopeCursor.y - 0.5) * 2 * Yamp * 1.2).toFixed(4);
         document.getElementById('lissaCursorInfo').textContent = 'X=' + voltX + 'V  Y=' + voltY + 'V';
         var axFont = lissaIsMobile ? '13px system-ui' : '11px system-ui';
         var tkFont = lissaIsMobile ? '12px Courier New' : '10px Courier New';
@@ -1181,12 +1193,12 @@
         ctx.fillText('Y: Ur (电阻电压)', 0, 0); ctx.restore();
         ctx.fillStyle = '#5a6a7a'; ctx.font = tkFont;
         for (var i = 0; i <= 4; i++) {
-            var v = (Xamp * 1.2 * (i / 2 - 1)).toFixed(1);
+            var v = (Xamp * 1.2 * (i / 2 - 1)).toFixed(4);
             ctx.fillText(v, pad + gW * i / 4, H - pad + 14);
         }
         ctx.textAlign = 'right';
         for (var i = 0; i <= 4; i++) {
-            var v = (Yamp * 1.2 * (1 - i / 2)).toFixed(2);
+            var v = (Yamp * 1.2 * (1 - i / 2)).toFixed(4);
             ctx.fillText(v, pad - 4, pad + gH * i / 4 + 4);
         }
     }
@@ -1238,7 +1250,7 @@
             ctx.beginPath(); ctx.moveTo(f0x, pad.t); ctx.lineTo(f0x, pad.t + gH); ctx.stroke();
             ctx.setLineDash([]);
             ctx.fillStyle = '#e74c3c'; ctx.font = 'bold 11px system-ui'; ctx.textAlign = 'center';
-            ctx.fillText('f\u2080=' + f0.toFixed(0) + 'Hz', f0x, pad.t - 6);
+            ctx.fillText('f\u2080=' + f0.toFixed(4) + 'Hz', f0x, pad.t - 6);
         }
         if (lissaAcquiredData.length > 1) {
             var sorted = lissaAcquiredData.slice().sort(function (a, b) { return a.freq - b.freq; });
@@ -1280,7 +1292,7 @@
         ctx.beginPath(); ctx.moveTo(curX, curY); ctx.lineTo(pad.l, curY); ctx.stroke();
         ctx.setLineDash([]);
         ctx.fillStyle = '#e74c3c'; ctx.font = 'bold 11px Courier New'; ctx.textAlign = 'left';
-        ctx.fillText(info.I.toFixed(1) + ' mA', curX + 8, curY - 4);
+        ctx.fillText(info.I.toFixed(4) + ' mA', curX + 8, curY - 4);
         ctx.fillStyle = '#5a6a7a'; ctx.font = lissaIsMobile ? '12px Courier New' : '10px Courier New';
         ctx.fillText(curFreq + ' Hz', curX + 8, curY + 10);
         var cAxFont = lissaIsMobile ? '14px system-ui' : '12px system-ui';
@@ -1288,12 +1300,12 @@
         ctx.fillText('频率 f (Hz)', pad.l + gW / 2, H - 8);
         for (var i = 0; i <= 5; i++) {
             var f = fMin + fRange * i / 5;
-            ctx.fillText(f.toFixed(0), pad.l + gW * i / 5, H - pad.b + 18);
+            ctx.fillText(f.toFixed(4), pad.l + gW * i / 5, H - pad.b + 18);
         }
         ctx.textAlign = 'right';
         for (var i = 0; i <= 5; i++) {
             var I = iMax * (1 - i / 5);
-            ctx.fillText(I.toFixed(1), pad.l - 6, pad.t + gH * i / 5 + 4);
+            ctx.fillText(I.toFixed(4), pad.l - 6, pad.t + gH * i / 5 + 4);
         }
         ctx.save(); ctx.translate(14, pad.t + gH / 2); ctx.rotate(-Math.PI / 2);
         ctx.textAlign = 'center'; ctx.fillText('电流 I (mA)', 0, 0); ctx.restore();
@@ -1346,9 +1358,9 @@
         console.log('[Sweep] 频率点数:', unique.length, '范围:', unique[0], '-', unique[unique.length-1]);
         lissaAcquiredData = [];
         _lissaSweeping = true;
-        var sweepFMin = Math.max(50, f0 * 0.15);
-        var sweepFMax = f0 * 4;
-        _lissaAmpFixedRange = { fMin: sweepFMin, fMax: sweepFMax };
+        _lissaAmpFixedRange = { fMin: 1100, fMax: 3200 };
+
+
         var idx = 0;
         function step() {
             try {
@@ -1364,7 +1376,7 @@
                 params.fStart = f; params.fEnd = f;
                 lissaUpdateMeasure();
                 var info = lissaCalcMeasure();
-                if (idx % 10 === 0) console.log('[Sweep] step', idx, 'freq=', f, 'I=', info.I.toFixed(2), 'f0=', info.f0.toFixed(0));
+                if (idx % 10 === 0) console.log('[Sweep] step', idx, 'freq=', f, 'I=', info.I.toFixed(4), 'f0=', info.f0.toFixed(4));
                 lissaAcquiredData.push({ freq: f, current: info.I, urpp: info.Urpp, impedance: info.z.Z, phase: info.z.phi });
                 lissaUpdateTable();
                 lissaDrawAmpChart(info);
@@ -1402,11 +1414,11 @@
             var isRes = (idx === resIdx);
             html += '<tr' + (isRes ? ' style="background:#fde8e8"' : '') + '>';
             html += '<td>' + (idx + 1) + '</td>';
-            html += '<td>' + d.freq.toFixed(0) + '</td>';
-            html += '<td>' + d.current.toFixed(2) + '</td>';
-            html += '<td>' + d.urpp.toFixed(3) + '</td>';
-            html += '<td>' + d.impedance.toFixed(1) + '</td>';
-            html += '<td>' + d.phase.toFixed(1) + '</td>';
+            html += '<td>' + d.freq.toFixed(4) + '</td>';
+            html += '<td>' + d.current.toFixed(4) + '</td>';
+            html += '<td>' + d.urpp.toFixed(4) + '</td>';
+            html += '<td>' + d.impedance.toFixed(4) + '</td>';
+            html += '<td>' + d.phase.toFixed(4) + '</td>';
             html += '<td>' + (isRes ? '<span style="color:#e74c3c;font-weight:700;">\u2605 谐振</span>' : '') + '</td>';
             html += '</tr>';
         });
@@ -1422,23 +1434,37 @@
         var csv = '序号,频率(Hz),电流(mA),Urpp(V),阻抗(Ω),相位(°),标记\r\n';
         lissaAcquiredData.forEach(function (d, i) {
             var tag = (i === resIdx) ? '谐振' : '';
-            csv += (i + 1) + ',' + d.freq.toFixed(0) + ',' + d.current.toFixed(3) + ',' + d.urpp.toFixed(4) + ',' + d.impedance.toFixed(1) + ',' + d.phase.toFixed(1) + ',' + tag + '\r\n';
+            csv += (i + 1) + ',' + d.freq.toFixed(4) + ',' + d.current.toFixed(4) + ',' + d.urpp.toFixed(4) + ',' + d.impedance.toFixed(4) + ',' + d.phase.toFixed(4) + ',' + tag + '\r\n';
         });
         var peak = lissaAcquiredData.reduce(function (a, b) { return a.current > b.current ? a : b; });
-        csv += '\r\n谐振峰值电流:,' + peak.current.toFixed(3) + ' mA\r\n';
-        csv += '对应频率:,' + peak.freq.toFixed(0) + ' Hz\r\n';
-        csv += '理论谐振频率:,' + f0.toFixed(1) + ' Hz\r\n';
+        csv += '\r\n谐振峰值电流:,' + peak.current.toFixed(4) + ' mA\r\n';
+        csv += '对应频率:,' + peak.freq.toFixed(4) + ' Hz\r\n';
+        csv += '理论谐振频率:,' + f0.toFixed(4) + ' Hz\r\n';
         navigator.clipboard.writeText(csv).then(function () {
             alert('✅ CSV已复制到剪贴板！\n共 ' + lissaAcquiredData.length + ' 个数据点');
         }).catch(function () { prompt('复制以下数据:', csv); });
     }
-    function lissaClearData() {
+        function lissaClearData() {
         lissaAcquiredData = [];
         _lissaAmpFixedRange = null;
+        document.getElementById('lissaFreqMin').value = '';
+        document.getElementById('lissaFreqMax').value = '';
         lissaUpdateTable();
         var info = lissaCalcMeasure();
         lissaDrawAmpChart(info);
     }
+    function lissaApplyFreqRange() {
+        var minVal = parseFloat(document.getElementById('lissaFreqMin').value);
+        var maxVal = parseFloat(document.getElementById('lissaFreqMax').value);
+        if (isNaN(minVal) || isNaN(maxVal) || minVal <= 0 || maxVal <= 0 || maxVal <= minVal) {
+            alert('请输入有效的频率范围（起始>0，终止>起始）');
+            return;
+        }
+        _lissaAmpFixedRange = { fMin: minVal, fMax: maxVal };
+        var info = lissaCalcMeasure();
+        lissaDrawAmpChart(info);
+    }
+
 
     /* ========== 李萨如双画布 - 动画循环 ========== */
     function lissaAnimate() {
@@ -1490,7 +1516,10 @@
             var newF = Math.round(pi.fMin + pi.fRange * ratio);
             newF = Math.max(100, Math.min(10000, newF));
             params.fStart = newF; params.fEnd = newF;
-            _lissaAmpFixedRange = null;
+                        var mrMin = document.getElementById('lissaFreqMin').value;
+            var mrMax = document.getElementById('lissaFreqMax').value;
+            if (!mrMin || !mrMax) _lissaAmpFixedRange = null;
+
             lissaUpdateMeasure();
             var info = lissaCalcMeasure();
             lissaDrawAmpChart(info);
@@ -1555,10 +1584,10 @@
             html += '<tr>' +
                 '<td style="white-space:nowrap;font-size:0.7rem;">' + r.time + '</td>' +
                 '<td>' + p.R + '</td><td>' + p.L + '</td><td>' + p.C + '</td><td>' + p.V + '</td>' +
-                '<td style="color:#667eea;font-weight:600;">' + s.fr.toFixed(2) + '</td>' +
-                '<td>' + s.Q.toFixed(2) + '</td>' +
-                '<td>' + s.BW.toFixed(2) + '</td>' +
-                '<td>' + s.Imax.toFixed(2) + '</td>' +
+                '<td style="color:#667eea;font-weight:600;">' + s.fr.toFixed(4) + '</td>' +
+                '<td>' + s.Q.toFixed(4) + '</td>' +
+                '<td>' + s.BW.toFixed(4) + '</td>' +
+                '<td>' + s.Imax.toFixed(4) + '</td>' +
                 '<td style="white-space:nowrap;">' +
                 '<button onclick="loadHistoryRecord(' + i + ')" style="color:#667eea;border:1px solid #667eea;background:white;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:0.7rem;margin-right:4px;" title="加载此参数到电路">加载</button>' +
                 '<button onclick="deleteHistoryRecord(' + i + ')" style="color:#dc3545;border:1px solid #dc3545;background:white;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:0.7rem;" title="删除此记录">删除</button>' +
@@ -1667,7 +1696,8 @@
             time: timeStr,
             data: JSON.parse(JSON.stringify(measuredData)),
             count: measuredData.length,
-            freqRange: minFreq.toFixed(0) + '~' + maxFreq.toFixed(0) + 'Hz'
+            freqRange: (minFreq/1000).toFixed(4) + '~' + (maxFreq/1000).toFixed(4) + 'kHz'
+
         };
         records.unshift(record);
         if (records.length > MAX_MEAS_HISTORY) records = records.slice(0, MAX_MEAS_HISTORY);
@@ -1696,6 +1726,7 @@
         }
         tbody.innerHTML = html;
     }
+
 
     function loadMeasHistoryRecord(index) {
         var records = getMeasHistoryDB();
