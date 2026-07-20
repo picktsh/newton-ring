@@ -100,9 +100,9 @@ export function initDragDrop(loadImageFileCallback) {
         e.preventDefault();
         dragCounter = 0;
         document.body.classList.remove('drag-over');
-        const files = e.dataTransfer.files;
-        if (files.length > 0 && files[0].type.startsWith('image/')) {
-            await loadImageFileCallback(files[0]);
+        const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith('image/'));
+        if (files.length > 0) {
+            await loadImageFileCallback(files);
         } else {
             alert('❌ 请拖拽图片文件');
         }

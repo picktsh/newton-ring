@@ -313,7 +313,7 @@ function detectDarkRingsRadial(grayMat, centerX, centerY, maxRadius) {
       profile[i].smoothedIntensity = smoothed[i];
     }
     // 直接找平滑后的局部最小值
-    const minima = findMinimaDirect(profile);
+    const minima = findMinimaDirect(profile, maxRadius);
     allMinima.push(...minima);
   }
 
@@ -368,21 +368,28 @@ function savitzkyGolaySmooth(data, windowSize, polyOrder) {
 }
 
 // 直接找平滑后剖面的局部最小值 (暗环 = 亮度谷底)
-function findMinimaDirect(profile) {
+function findMinimaDirect(profile, maxRadius) {
   if (profile.length < 10) return [];
 
   const minima = [];
   const n = profile.length;
-  // 自适应窗口：根据当前位置的半径估计环间距
-  // 牛顿环间距 dr ≈ Rλ/(2r)，随r增大而减小
-  // 用固定最小间距3像素，最大间距15像素
+
+  // 估计当前半径处的预期环间距
+  // 牛顿环 r_m² = m*λR，所以 dr/dm = λR/(2r) ≈ r/(2m)
+  // 粗略估计：总环数约20-25，平均间距 = maxRadius/22
+  const avgSpacing = maxRadius / 22;
 
   for (let i = 3; i < n - 3; i++) {
     const current = profile[i].smoothedIntensity;
+    const r = profile[i].radius;
+    // 动态checkRange：约为预期间距的1/3
+    const checkRange = Math.max(2, Math.round(avgSpacing / 3));
+    const iStart = Math.max(0, i - checkRange);
+    const iEnd = Math.min(n - 1, i + checkRange);
+
     // 检查是否是局部最小值
     let isMin = true;
-    const checkRange = 3;
-    for (let j = i - checkRange; j <= i + checkRange; j++) {
+    for (let j = iStart; j <= iEnd; j++) {
       if (j !== i && profile[j].smoothedIntensity < current) {
         isMin = false;
         break;
@@ -390,15 +397,16 @@ function findMinimaDirect(profile) {
     }
     if (!isMin) continue;
 
-    // 计算对比度：与两侧平均值比较
-    const leftStart = Math.max(0, i - 8);
-    const rightEnd = Math.min(n - 1, i + 8);
+    // 计算对比度：与两侧较大范围比较
+    const sideRange = Math.max(5, Math.round(avgSpacing / 2));
+    const leftStart = Math.max(0, i - sideRange * 2);
+    const rightEnd = Math.min(n - 1, i + sideRange * 2);
     let leftSum = 0, leftCount = 0, rightSum = 0, rightCount = 0;
-    for (let j = leftStart; j < i - 3; j++) {
+    for (let j = leftStart; j < i - sideRange; j++) {
       leftSum += profile[j].smoothedIntensity;
       leftCount++;
     }
-    for (let j = i + 4; j <= rightEnd; j++) {
+    for (let j = i + sideRange + 1; j <= rightEnd; j++) {
       rightSum += profile[j].smoothedIntensity;
       rightCount++;
     }
@@ -406,20 +414,20 @@ function findMinimaDirect(profile) {
                             (rightCount > 0 ? rightSum / rightCount : current)) / 2;
     const contrast = surroundingAvg - current;
 
-    // 自适应对比度阈值
-    const radiusRatio = profile[i].radius / n;
-    const minContrast = radiusRatio < 0.3 ? 10 : (radiusRatio < 0.6 ? 6 : 4);
+    // 提高对比度阈值，只保留明显的暗环
+    const minContrast = 15;
 
     if (contrast > minContrast) {
-      minima.push({ radius: profile[i].radius, contrast, intensity: current });
+      minima.push({ radius: r, contrast, intensity: current });
     }
   }
 
-  // 非极大值抑制：间距太近的只保留对比度最高的
+  // 非极大值抑制：间距至少为预期环间距的60%
   const suppressed = [];
   minima.sort((a, b) => a.radius - b.radius);
+  const minDist = avgSpacing * 0.6;
   for (const m of minima) {
-    if (suppressed.length === 0 || m.radius - suppressed[suppressed.length - 1].radius > 3) {
+    if (suppressed.length === 0 || m.radius - suppressed[suppressed.length - 1].radius > minDist) {
       suppressed.push(m);
     } else if (m.contrast > suppressed[suppressed.length - 1].contrast) {
       suppressed[suppressed.length - 1] = m;
@@ -435,17 +443,19 @@ function clusterRadiiByPhysics(minima, numAngles) {
 
   minima.sort((a, b) => a.radius - b.radius);
 
-  // 第一步：宽松聚类 (容差随半径自适应)
+  // 第一步：聚类 (容差为预期环间距的40%)
   const clusters = [];
   let currentCluster = [minima[0]];
+  // 估计平均环间距
+  const maxR = minima[minima.length - 1].radius;
+  const avgSpacing = maxR / 22;
+  const clusterTolerance = avgSpacing * 0.4;
 
   for (let i = 1; i < minima.length; i++) {
     const avgR = currentCluster.reduce((sum, m) => sum + m.radius, 0) / currentCluster.length;
     const currRadius = minima[i].radius;
-    // 自适应容差：外圈环密，容差小；内圈环疏，容差大
-    const adaptiveTolerance = Math.max(2, 6 - avgR * 0.015);
 
-    if (currRadius - avgR <= adaptiveTolerance) {
+    if (currRadius - avgR <= clusterTolerance) {
       currentCluster.push(minima[i]);
     } else {
       clusters.push({
@@ -464,14 +474,14 @@ function clusterRadiiByPhysics(minima, numAngles) {
 
   console.log(`初步聚类: ${clusters.length} 个候选环`);
 
-  // 第二步：过滤出现次数太少的
-  const minOccurrences = Math.max(5, Math.ceil(numAngles * 0.15));
-  let validClusters = clusters.filter(c => c.count >= minOccurrences && c.radius >= 8);
+  // 第二步：过滤出现次数太少的 (至少20%角度出现)
+  const minOccurrences = Math.max(8, Math.ceil(numAngles * 0.2));
+  let validClusters = clusters.filter(c => c.count >= minOccurrences && c.radius >= 10);
 
   if (validClusters.length < 3) {
     console.log(`有效聚类太少(${validClusters.length})，降低阈值`);
-    const lowerThreshold = Math.max(3, Math.ceil(numAngles * 0.1));
-    validClusters = clusters.filter(c => c.count >= lowerThreshold && c.radius >= 8);
+    const lowerThreshold = Math.max(5, Math.ceil(numAngles * 0.12));
+    validClusters = clusters.filter(c => c.count >= lowerThreshold && c.radius >= 10);
   }
 
   if (validClusters.length < 3) {

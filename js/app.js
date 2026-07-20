@@ -100,26 +100,40 @@ export default {
             if (container) container.scrollTop = container.scrollHeight;
         }
 
-        // 上传文件处理
+        // 上传文件处理 (支持多选)
         async function handleFileUpload(event) {
-            const file = event.target.files[0];
-            if (!file) return;
-            await loadImageFile(file);
+            const files = Array.from(event.target.files);
+            if (files.length === 0) return;
+            // 重置 input 以便重复选择同一文件
+            event.target.value = '';
+            await loadMultipleFiles(files);
         }
 
-        async function loadImageFile(file) {
-            await imageManager.loadImageFile(file, (resultData, isCached) => {
-                resultImageSrcRef.value = imageManager.getOriginalImageSrc();
-                if (isCached && resultData) {
-                    showStatus(`✅ 已加载缓存: ${file.name}`, 'success');
-                    nextTick(() => {
-                        restoreFromCache(resultData);
+        // 批量加载图片文件
+        async function loadMultipleFiles(files) {
+            const imageFiles = files.filter(f => f.type.startsWith('image/'));
+            if (imageFiles.length === 0) {
+                return showStatus(' 未找到有效图片文件', 'error');
+            }
+            showStatus(` 正在加载 ${imageFiles.length} 张图片...`, 'info');
+            // 依次加载所有图片（只加载不处理）
+            for (let i = 0; i < imageFiles.length; i++) {
+                const file = imageFiles[i];
+                await new Promise(resolve => {
+                    imageManager.loadImageFile(file, (resultData, isCached) => {
+                        if (isCached && resultData) {
+                            showStatus(`✅ 已加载缓存: ${file.name}`, 'success');
+                        } else {
+                            showStatus(`✅ 已加载: ${file.name}`, 'success');
+                        }
+                        resolve();
                     });
-                } else {
-                    showStatus(`✅ 图像已加载，自动处理中...`, 'info');
-                    setTimeout(() => processImage(), 500);
-                }
-            });
+                });
+            }
+            // 加载完成后，切换到最后一张并自动处理
+            const lastFile = imageFiles[imageFiles.length - 1];
+            showStatus(`🔄 开始处理: ${lastFile.name}`, 'info');
+            setTimeout(() => processImage(), 300);
         }
 
         // OpenCV 图像处理主函数
@@ -333,7 +347,7 @@ export default {
             });
 
             initOpenCV();
-            initDragDrop(loadImageFile);
+            initDragDrop(loadMultipleFiles);
         });
 
         return {
