@@ -93,6 +93,25 @@
         .avg-radius-card h3 { color: #333; margin-bottom: 10px; }
         .avg-radius-card p { font-size: 18px; color: #667eea; font-weight: bold; }
 
+        /* Tab Navigation */
+        .tab-nav { display: flex; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); padding: 0 20px; gap: 4px; }
+        .tab-btn { padding: 12px 16px; border: none; background: rgba(255,255,255,0.15); color: rgba(255,255,255,0.7); font-size: 14px; font-weight: bold; cursor: pointer; border-radius: 8px 8px 0 0; transition: all 0.2s; }
+        .tab-btn:hover { background: rgba(255,255,255,0.25); color: white; }
+        .tab-btn.active { background: white; color: #667eea; }
+
+        /* Calibration Tab */
+        .calibration-upload-row { display: flex; gap: 15px; align-items: center; flex-wrap: wrap; }
+        .calibration-upload-btn { padding: 8px 16px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: bold; transition: transform 0.2s; }
+        .calibration-upload-btn:hover { transform: translateY(-1px); box-shadow: 0 3px 8px rgba(102,126,234,0.4); }
+        .calibration-overlay-container { position: relative; border: 1px solid #ddd; border-radius: 4px; overflow: hidden; background: #f0f0f0; cursor: crosshair; }
+        .calibration-overlay-container img { display: block; width: 100%; height: auto; }
+        .calibration-overlay-container canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+        .calibration-result { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }
+        .calibration-metric { padding: 12px; background: #f8f9fa; border-radius: 6px; border-left: 3px solid #667eea; }
+        .calibration-metric label { font-size: 12px; color: #666; display: block; margin-bottom: 4px; }
+        .calibration-metric .value { font-size: 18px; font-weight: bold; color: #333; }
+        .calibration-hint { padding: 10px; background: #fff3cd; border-radius: 6px; font-size: 13px; color: #856404; margin-top: 10px; }
+
         /* Responsive */
         @media (max-width: 768px) { .grid-2 { grid-template-columns: 1fr; } .grid-auto { grid-template-columns: 1fr; } }
     </style>
@@ -144,7 +163,14 @@
                 </p>
             </div>
 
-            <div class="content">
+            <!-- Tab Navigation -->
+            <div class="tab-nav">
+                <button class="tab-btn" :class="{ active: activeTab === 'rings' }" @click="activeTab = 'rings'">🔬 牛顿环识别</button>
+                <button class="tab-btn" :class="{ active: activeTab === 'calibration' }" @click="activeTab = 'calibration'">📏 像素标定值测定</button>
+            </div>
+
+            <!-- Tab 1: 牛顿环识别 -->
+            <div class="content" v-show="activeTab === 'rings'">
                 <!-- Image Thumbnails -->
                 <div class="processed-images-list card" v-if="processedImages.length > 0">
                     <div
@@ -340,6 +366,151 @@
 
                 <!-- Hidden File Input -->
                 <input type="file" ref="fileInputRef" accept="image/*" multiple @change="handleFileUpload" style="display: none;">
+            </div>
+
+            <!-- Tab 2: 像素标定值测定 -->
+            <div class="content" v-show="activeTab === 'calibration'">
+                <!-- 操作说明 -->
+                <div class="card" style="border-left: 4px solid #667eea;">
+                    <h3 style="color: #333; margin-bottom: 8px;">📏 像素标定值测定</h3>
+                    <p style="font-size: 13px; color: #666; line-height: 1.6;">
+                        通过转动测微鼓轮，先后拍摄两张显微镜视野图片。上传后分别在两张图上点击同一特征点，系统计算像素距离。
+                        输入鼓轮实际移动的物理距离，即可算出标定值（mm/像素）。
+                    </p>
+                </div>
+
+                <!-- 图片上传区 -->
+                <div class="card">
+                    <div class="calibration-upload-row">
+                        <span style="font-weight: bold; color: #333;">图片A:</span>
+                        <button class="calibration-upload-btn" @click="calibFileInputA.click()">
+                            {{ calibImageA ? '✅ ' + calibImageA.name : '📷 选择图片A' }}
+                        </button>
+                        <button v-if="calibImageA" class="calibration-upload-btn" style="background: #e74c3c; padding: 6px 10px; font-size: 12px;" @click="removeCalibImage('A')">
+                            ✖ 删除
+                        </button>
+                        <span style="font-weight: bold; color: #333;">图片B:</span>
+                        <button class="calibration-upload-btn" @click="calibFileInputB.click()">
+                            {{ calibImageB ? '✅ ' + calibImageB.name : '📷 选择图片B' }}
+                        </button>
+                        <button v-if="calibImageB" class="calibration-upload-btn" style="background: #e74c3c; padding: 6px 10px; font-size: 12px;" @click="removeCalibImage('B')">
+                            ✖ 删除
+                        </button>
+                        <button v-if="calibImageA || calibImageB" class="calibration-upload-btn" style="background: linear-gradient(135deg, #e74c3c, #c0392b);" @click="resetCalibration">
+                            🔄 全部重置
+                        </button>
+                    </div>
+                    <input type="file" ref="calibFileInputA" accept="image/*" @change="handleCalibUploadA" style="display: none;">
+                    <input type="file" ref="calibFileInputB" accept="image/*" @change="handleCalibUploadB" style="display: none;">
+                </div>
+
+                <!-- 空状态提示 -->
+                <div v-if="!calibImageA && !calibImageB" class="card" style="text-align: center; padding: 60px 20px;">
+                    <div style="font-size: 48px; margin-bottom: 15px; opacity: 0.3;">📷</div>
+                    <p style="font-size: 16px; color: #999; margin-bottom: 8px;">尚未上传标定图片</p>
+                    <p style="font-size: 13px; color: #bbb;">请分别上传图A和图B，然后在两张图上标记同一特征点</p>
+                </div>
+
+                <!-- 叠加显示与点击选点区域 -->
+                <div class="card" v-if="calibImageA || calibImageB">
+                    <h3 style="color: #333; margin-bottom: 10px;">
+                        点击标记特征点
+                        <span style="font-size: 12px; color: #999; margin-left: 10px;">
+                            {{ calibPointA ? '✅ A点已标记' : '⬜ 请在图A上点击特征点' }}
+                            &nbsp;|&nbsp;
+                            {{ calibPointB ? '✅ B点已标记' : '⬜ 请在图B上点击特征点' }}
+                        </span>
+                        <span v-if="calibPointA || calibPointB" style="font-size: 11px; color: #667eea; margin-left: 10px;">
+                            ⌨️ 方向键微调当前标记 (Shift+方向键=5px)
+                            &nbsp;|&nbsp;
+                            当前调整: <b>{{ calibActiveSlot === 'A' ? '图A' : '图B' }}</b>
+                        </span>
+                    </h3>
+                    <div style="display: flex; gap: 15px; flex-wrap: wrap;">
+                        <!-- 图A选点区 -->
+                        <div style="flex: 1; min-width: 300px;">
+                            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 5px;">
+                                <p style="font-size: 12px; color: #667eea; font-weight: bold; margin: 0;">图A - 点击选择特征点</p>
+                                <label style="font-size: 11px; color: #999; margin-left: auto;">鼓轮刻度:</label>
+                                <input type="number" v-model.number="calibScaleA" step="0.001" placeholder="mm" style="width: 100px; padding: 4px 6px; border: 1px solid #667eea; border-radius: 3px; font-size: 12px; text-align: right;">
+                            </div>
+                            <div class="calibration-overlay-container" ref="calibContainerA" @click="onCalibClickA">
+                                <img v-if="calibImageA" :src="calibImageA.src" alt="图A">
+                                <canvas ref="calibCanvasA" style="pointer-events: none;"></canvas>
+                                <div v-if="!calibImageA" style="display: flex; align-items: center; justify-content: center; height: 300px; color: #999;">请先上传图片A</div>
+                            </div>
+                        </div>
+                        <!-- 图B选点区 -->
+                        <div style="flex: 1; min-width: 300px;">
+                            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 5px;">
+                                <p style="font-size: 12px; color: #764ba2; font-weight: bold; margin: 0;">图B - 点击选择特征点</p>
+                                <label style="font-size: 11px; color: #999; margin-left: auto;">鼓轮刻度:</label>
+                                <input type="number" v-model.number="calibScaleB" step="0.001" placeholder="mm" style="width: 100px; padding: 4px 6px; border: 1px solid #764ba2; border-radius: 3px; font-size: 12px; text-align: right;">
+                            </div>
+                            <div class="calibration-overlay-container" ref="calibContainerB" @click="onCalibClickB">
+                                <img v-if="calibImageB" :src="calibImageB.src" alt="图B">
+                                <canvas ref="calibCanvasB" style="pointer-events: none;"></canvas>
+                                <div v-if="!calibImageB" style="display: flex; align-items: center; justify-content: center; height: 300px; color: #999;">请先上传图片B</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="calibration-hint">
+                        💡 提示: 在两张图上分别点击同一个物理特征点。点击某张图后，可用 <b>方向键</b> 微调标记位置（按住 Shift 每次移动 5px）。
+                    </div>
+                </div>
+
+                <!-- 测量结果 -->
+                <div class="card" v-if="calibPointA && calibPointB">
+                    <h3 style="color: #333; margin-bottom: 15px;">📊 测量结果</h3>
+                    <div class="calibration-result">
+                        <div class="calibration-metric">
+                            <label>ΔX (像素)</label>
+                            <div class="value">{{ calibDeltaX.toFixed(2) }}</div>
+                        </div>
+                        <div class="calibration-metric">
+                            <label>ΔY (像素)</label>
+                            <div class="value">{{ calibDeltaY.toFixed(2) }}</div>
+                        </div>
+                        <div class="calibration-metric" style="border-left-color: #e74c3c;">
+                            <label>像素距离 (px)</label>
+                            <div class="value" style="color: #e74c3c;">{{ calibPixelDistance.toFixed(2) }}</div>
+                        </div>
+                    </div>
+
+                    <!-- 物理距离：自动差值 + 手动覆盖 -->
+                    <div style="margin-top: 20px;">
+                        <div style="display: flex; align-items: center; gap: 15px; flex-wrap: wrap; margin-bottom: 10px;">
+                            <label style="font-weight: bold; color: #333;">鼓轮刻度差 (mm):</label>
+                            <span style="font-size: 16px; color: #e74c3c; font-weight: bold;">
+                                {{ calibAutoDistance > 0 ? calibAutoDistance.toFixed(3) : '—' }}
+                            </span>
+                            <span v-if="calibScaleA != null && calibScaleB != null" style="font-size: 12px; color: #999;">
+                                = |{{ calibScaleA }} − {{ calibScaleB }}|
+                            </span>
+                        </div>
+                        <div style="display: flex; align-items: center; gap: 15px; flex-wrap: wrap;">
+                            <label style="font-weight: bold; color: #333;">实际移动距离 (mm):</label>
+                            <input type="number" v-model.number="calibDistanceManual" step="0.001" min="0" :placeholder="calibAutoDistance > 0 ? calibAutoDistance.toFixed(3) + ' (自动)' : '输入物理距离'" style="width: 200px; padding: 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px;">
+                            <span v-if="calibAutoDistance > 0" style="font-size: 12px; color: #27ae60;">✔ 刻度变化时自动更新，可手动修改覆盖</span>
+                        </div>
+                    </div>
+
+                    <!-- 标定值结果 -->
+                    <div class="calibration-metric" style="margin-top: 15px; border-left-color: #27ae60; background: #eafaf1;">
+                        <label>标定值 (mm/像素)</label>
+                        <div class="value" style="color: #27ae60; font-size: 22px;">
+                            {{ calibValue > 0 ? calibValue.toFixed(6) : '—' }}
+                        </div>
+                        <small style="color: #666; margin-top: 5px; display: block;">
+                            {{ calibValue > 0 ? `即 1像素 = ${calibValue.toFixed(6)} mm` : '请输入物理距离以计算标定值' }}
+                        </small>
+                    </div>
+
+                    <!-- 应用到牛顿环 -->
+                    <button v-if="calibValue > 0" class="btn" style="margin-top: 15px; background: linear-gradient(135deg, #27ae60, #2ecc71);" @click="applyCalibration">
+                        ✅ 应用此标定值到牛顿环识别
+                    </button>
+                </div>
             </div>
         </div>
     </div>

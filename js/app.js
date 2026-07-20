@@ -7,7 +7,7 @@ import { initCanvasInteraction, onTableRowHover, onTableRowLeave, initDragDrop }
 import { calculateDiameterData, calculateRadiusData, calculateAverageRadius, generateCalculationResults } from './data-calculator.js';
 import { drawDetectionResults, clearCanvas } from './canvas-drawer.js';
 
-const { ref, reactive, computed, onMounted, nextTick } = Vue;
+const { ref, reactive, computed, onMounted, nextTick, watch } = Vue;
 
 // Vue 应用主组件
 export default {
@@ -19,6 +19,90 @@ export default {
         const logs = ref([]);
         const isProcessing = ref(false);
         const hoveredRingRef = ref(null);
+        // 当前活动标签页 (从 sessionStorage 恢复)
+        const activeTab = ref(sessionStorage.getItem('activeTab') || 'rings');
+        // 监听 tab 切换，持久化到 sessionStorage
+        watch(activeTab, (val) => { sessionStorage.setItem('activeTab', val); });
+        // ===== 像素标定状态 =====
+        // ===== 像素标定 sessionStorage 缓存 =====
+        const CALIB_KEY = 'calib_images';
+        const CALIB_POINT_KEY = 'calib_points';
+
+        function saveCalibToSession() {
+            try {
+                const data = {
+                    imageA: calibImageA.value ? { src: calibImageA.value.src, name: calibImageA.value.name, width: calibImageA.value.width, height: calibImageA.value.height } : null,
+                    imageB: calibImageB.value ? { src: calibImageB.value.src, name: calibImageB.value.name, width: calibImageB.value.width, height: calibImageB.value.height } : null,
+                    scaleA: calibScaleA.value,
+                    scaleB: calibScaleB.value,
+                    distanceManual: calibDistanceManual.value
+                };
+                sessionStorage.setItem(CALIB_KEY, JSON.stringify(data));
+                const points = {
+                    pointA: calibPointA.value,
+                    pointB: calibPointB.value,
+                    activeSlot: calibActiveSlot.value
+                };
+                sessionStorage.setItem(CALIB_POINT_KEY, JSON.stringify(points));
+            } catch (e) { console.warn('标定缓存保存失败:', e); }
+        }
+
+        function loadCalibFromSession() {
+            try {
+                const raw = sessionStorage.getItem(CALIB_KEY);
+                if (raw) {
+                    const data = JSON.parse(raw);
+                    calibImageA.value = data.imageA || null;
+                    calibImageB.value = data.imageB || null;
+                    calibScaleA.value = data.scaleA ?? null;
+                    calibScaleB.value = data.scaleB ?? null;
+                    calibDistanceManual.value = data.distanceManual ?? null;
+                }
+                const rawPoints = sessionStorage.getItem(CALIB_POINT_KEY);
+                if (rawPoints) {
+                    const pts = JSON.parse(rawPoints);
+                    calibPointA.value = pts.pointA || null;
+                    calibPointB.value = pts.pointB || null;
+                    calibActiveSlot.value = pts.activeSlot || 'A';
+                }
+            } catch (e) { console.warn('标定缓存加载失败:', e); }
+        }
+
+        const calibImageA = ref(null);  // { src, name, width, height }
+        const calibImageB = ref(null);
+        const calibPointA = ref(null);  // { x, y } 像素坐标
+        const calibPointB = ref(null);
+        const calibActiveSlot = ref('A');  // 当前键盘微调的目标图片
+        const calibScaleA = ref(null);       // 图A对应鼓轮刻度 (mm)
+        const calibScaleB = ref(null);       // 图B对应鼓轮刻度 (mm)
+        const calibDistanceManual = ref(null); // 手动输入的实际距离 (mm)，优先于自动差值
+        const calibFileInputA = ref(null);
+        const calibFileInputB = ref(null);
+        const calibCanvasA = ref(null);
+        const calibCanvasB = ref(null);
+
+        // 自动差值 (由刻度差计算)
+        const calibAutoDistance = computed(() => {
+            if (calibScaleA.value == null || calibScaleB.value == null) return 0;
+            return Math.abs(calibScaleA.value - calibScaleB.value);
+        });
+        // 最终使用的物理距离: 手动优先，否则自动差值
+        const calibPhysicalDistance = computed(() => {
+            if (calibDistanceManual.value != null && calibDistanceManual.value > 0) return calibDistanceManual.value;
+            return calibAutoDistance.value;
+        });
+
+        // 刻度变化时，自动将差值同步到距离输入框
+        watch(calibAutoDistance, (newVal) => {
+            if (newVal > 0) {
+                calibDistanceManual.value = Math.round(newVal * 1000) / 1000; // 保留3位小数
+            }
+        });
+
+        // 监听标定数据变化，自动缓存
+        watch([calibImageA, calibImageB, calibPointA, calibPointB, calibScaleA, calibScaleB, calibDistanceManual], () => {
+            saveCalibToSession();
+        });
         const initState = {
             // 获取滤镜参数初始值
             filterParams: ()=>({
@@ -98,6 +182,187 @@ export default {
         function scrollToBottom() {
             const container = logContainerRef.value;
             if (container) container.scrollTop = container.scrollHeight;
+        }
+
+        // ===== 像素标定计算 =====
+        const calibDeltaX = computed(() => {
+            if (!calibPointA.value || !calibPointB.value) return 0;
+            return Math.abs(calibPointA.value.x - calibPointB.value.x);
+        });
+        const calibDeltaY = computed(() => {
+            if (!calibPointA.value || !calibPointB.value) return 0;
+            return Math.abs(calibPointA.value.y - calibPointB.value.y);
+        });
+        const calibPixelDistance = computed(() => {
+            return Math.sqrt(calibDeltaX.value ** 2 + calibDeltaY.value ** 2);
+        });
+        const calibValue = computed(() => {
+            if (calibPixelDistance.value <= 0 || calibPhysicalDistance.value <= 0) return 0;
+            return calibPhysicalDistance.value / calibPixelDistance.value;
+        });
+
+        // 标定图片上传处理
+        function handleCalibUpload(event, slot) {
+            const file = event.target.files[0];
+            if (!file) return;
+            event.target.value = '';
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const img = new Image();
+                img.onload = () => {
+                    const data = { src: e.target.result, name: file.name, width: img.naturalWidth, height: img.naturalHeight };
+                    if (slot === 'A') {
+                        calibImageA.value = data;
+                        calibPointA.value = null;
+                    } else {
+                        calibImageB.value = data;
+                        calibPointB.value = null;
+                    }
+                    nextTick(() => drawCalibCanvas(slot));
+                };
+                img.src = e.target.result;
+            };
+            reader.readAsDataURL(file);
+        }
+        function handleCalibUploadA(e) { handleCalibUpload(e, 'A'); }
+        function handleCalibUploadB(e) { handleCalibUpload(e, 'B'); }
+
+        // 点击选点
+        function onCalibClick(slot, event) {
+            const container = event.currentTarget;
+            const img = container.querySelector('img');
+            if (!img) return;
+            calibActiveSlot.value = slot;  // 点击时自动设为当前微调目标
+            const rect = container.getBoundingClientRect();
+            const clickX = event.clientX - rect.left;
+            const clickY = event.clientY - rect.top;
+            // 将显示坐标转换为原始像素坐标
+            const scaleX = (slot === 'A' ? calibImageA.value.width : calibImageB.value.width) / img.clientWidth;
+            const scaleY = (slot === 'A' ? calibImageA.value.height : calibImageB.value.height) / img.clientHeight;
+            const px = Math.round(clickX * scaleX);
+            const py = Math.round(clickY * scaleY);
+            if (slot === 'A') {
+                calibPointA.value = { x: px, y: py };
+            } else {
+                calibPointB.value = { x: px, y: py };
+            }
+            nextTick(() => drawCalibCanvas(slot));
+        }
+        function onCalibClickA(e) { onCalibClick('A', e); }
+        function onCalibClickB(e) { onCalibClick('B', e); }
+
+        // 键盘方向键微调标记点
+        function onCalibKeydown(e) {
+            const slot = calibActiveSlot.value;
+            const point = slot === 'A' ? calibPointA.value : calibPointB.value;
+            if (!point) return;
+            const step = e.shiftKey ? 5 : 1;
+            let dx = 0, dy = 0;
+            switch (e.key) {
+                case 'ArrowUp': dy = -step; break;
+                case 'ArrowDown': dy = step; break;
+                case 'ArrowLeft': dx = -step; break;
+                case 'ArrowRight': dx = step; break;
+                default: return;
+            }
+            e.preventDefault();
+            const imgData = slot === 'A' ? calibImageA.value : calibImageB.value;
+            if (!imgData) return;
+            const newX = Math.max(0, Math.min(imgData.width - 1, point.x + dx));
+            const newY = Math.max(0, Math.min(imgData.height - 1, point.y + dy));
+            if (slot === 'A') {
+                calibPointA.value = { x: newX, y: newY };
+            } else {
+                calibPointB.value = { x: newX, y: newY };
+            }
+            nextTick(() => drawCalibCanvas(slot));
+        }
+
+        // 绘制标定画布 (精细十字标记)
+        function drawCalibCanvas(slot) {
+            const canvas = slot === 'A' ? calibCanvasA.value : calibCanvasB.value;
+            const imgEl = canvas?.parentElement?.querySelector('img');
+            if (!canvas || !imgEl) return;
+            canvas.width = imgEl.clientWidth;
+            canvas.height = imgEl.clientHeight;
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            const point = slot === 'A' ? calibPointA.value : calibPointB.value;
+            const imgData = slot === 'A' ? calibImageA.value : calibImageB.value;
+            if (!point || !imgData) return;
+            // 像素坐标 → 显示坐标
+            const displayX = point.x * imgEl.clientWidth / imgData.width;
+            const displayY = point.y * imgEl.clientHeight / imgData.height;
+            const color = slot === 'A' ? '#667eea' : '#764ba2';
+            // 画长十字线（贯穿整个图片，细线）
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 1;
+            ctx.globalAlpha = 0.4;
+            ctx.beginPath();
+            ctx.moveTo(0, displayY);
+            ctx.lineTo(canvas.width, displayY);
+            ctx.moveTo(displayX, 0);
+            ctx.lineTo(displayX, canvas.height);
+            ctx.stroke();
+            ctx.globalAlpha = 1;
+            // 画中心精细十字（短而细）
+            ctx.lineWidth = 1;
+            ctx.strokeStyle = color;
+            const gap = 4;  // 中心留空
+            const arm = 18; // 臂长
+            ctx.beginPath();
+            ctx.moveTo(displayX - arm, displayY);
+            ctx.lineTo(displayX - gap, displayY);
+            ctx.moveTo(displayX + gap, displayY);
+            ctx.lineTo(displayX + arm, displayY);
+            ctx.moveTo(displayX, displayY - arm);
+            ctx.lineTo(displayX, displayY - gap);
+            ctx.moveTo(displayX, displayY + gap);
+            ctx.lineTo(displayX, displayY + arm);
+            ctx.stroke();
+            // 画小圆点
+            ctx.beginPath();
+            ctx.arc(displayX, displayY, 2, 0, Math.PI * 2);
+            ctx.fillStyle = color;
+            ctx.fill();
+            // 标注坐标
+            ctx.fillStyle = color;
+            ctx.font = '11px monospace';
+            ctx.fillText(`(${point.x}, ${point.y})`, displayX + 10, displayY - 8);
+        }
+
+        // 删除单张标定图片
+        function removeCalibImage(slot) {
+            if (slot === 'A') {
+                calibImageA.value = null;
+                calibPointA.value = null;
+            } else {
+                calibImageB.value = null;
+                calibPointB.value = null;
+            }
+            saveCalibToSession();
+        }
+
+        // 重置标定
+        function resetCalibration() {
+            calibImageA.value = null;
+            calibImageB.value = null;
+            calibPointA.value = null;
+            calibPointB.value = null;
+            calibScaleA.value = null;
+            calibScaleB.value = null;
+            calibDistanceManual.value = null;
+            sessionStorage.removeItem(CALIB_KEY);
+            sessionStorage.removeItem(CALIB_POINT_KEY);
+        }
+
+        // 应用标定值到牛顿环识别
+        function applyCalibration() {
+            if (calibValue.value > 0) {
+                pixelScale.value = calibValue.value;
+                activeTab.value = 'rings';
+                showStatus(`✅ 标定值已应用: ${calibValue.value.toFixed(6)} mm/像素`, 'success');
+            }
         }
 
         // 上传文件处理 (支持多选)
@@ -347,7 +612,15 @@ export default {
             });
 
             initOpenCV();
-            initDragDrop(loadMultipleFiles);
+            initDragDrop(loadMultipleFiles, () => activeTab.value === 'rings');
+            // 键盘方向键微调标定标记
+            document.addEventListener('keydown', onCalibKeydown);
+            // 恢复标定图片缓存
+            loadCalibFromSession();
+            nextTick(() => {
+                if (calibImageA.value) drawCalibCanvas('A');
+                if (calibImageB.value) drawCalibCanvas('B');
+            });
         });
 
         return {
@@ -355,6 +628,7 @@ export default {
             pixelScale,
             logs,
             isProcessing,
+            activeTab,
             processedImages: imageManager.processedImages,
             currentFingerprint: imageManager.currentFingerprint,
             filterParams,
@@ -375,6 +649,21 @@ export default {
             averageRadius,
             calculationResults,
             hoveredRing: hoveredRingRef,
+
+            // 像素标定
+            calibImageA, calibImageB,
+            calibPointA, calibPointB,
+            calibScaleA, calibScaleB,
+            calibDistanceManual,
+            calibAutoDistance, calibPhysicalDistance,
+            calibDeltaX, calibDeltaY, calibPixelDistance, calibValue,
+            calibFileInputA, calibFileInputB,
+            calibCanvasA, calibCanvasB,
+            calibActiveSlot,
+            handleCalibUploadA, handleCalibUploadB,
+            onCalibClickA, onCalibClickB,
+            removeCalibImage,
+            resetCalibration, applyCalibration,
 
             handleFileUpload,
             processImage,

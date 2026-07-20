@@ -79,15 +79,18 @@ function redrawOverlay(canvas, rings, hoveredRing) {
 }
 
 // 初始化拖拽上传功能
-export function initDragDrop(loadImageFileCallback) {
+export function initDragDrop(loadImageFileCallback, shouldAccept) {
     let dragCounter = 0;
     document.body.addEventListener('dragenter', (e) => {
         e.preventDefault();
+        // 只有当 shouldAccept 返回 true 时才显示拖拽提示
+        if (shouldAccept && !shouldAccept()) return;
         dragCounter++;
         document.body.classList.add('drag-over');
     });
     document.body.addEventListener('dragleave', (e) => {
         e.preventDefault();
+        if (shouldAccept && !shouldAccept()) return;
         dragCounter--;
         if (dragCounter === 0) {
             document.body.classList.remove('drag-over');
@@ -100,6 +103,8 @@ export function initDragDrop(loadImageFileCallback) {
         e.preventDefault();
         dragCounter = 0;
         document.body.classList.remove('drag-over');
+        // 如果当前不在允许的区域，忽略
+        if (shouldAccept && !shouldAccept()) return;
         const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith('image/'));
         if (files.length > 0) {
             await loadImageFileCallback(files);
