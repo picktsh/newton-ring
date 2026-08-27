@@ -117,8 +117,8 @@ export function createImageManager() {
         onSwitchCallback?.(resultData);
     }
 
-    // 保存检测结果到 sessionStorage
-    function saveCurrentResultToCache(detectedRings) {
+    // 保存检测结果到 sessionStorage (圆心随结果一并缓存，供人工核对/重新识别复用)
+    function saveCurrentResultToCache(detectedRings, center = null) {
         if (!currentFingerprint.value) return;
 
         const ringsData = detectedRings.map(ring => ({
@@ -130,6 +130,7 @@ export function createImageManager() {
         }));
         const resultData = {
             detectedRings: ringsData,
+            center,
             timestamp: Date.now()
         };
 

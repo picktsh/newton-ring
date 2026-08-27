@@ -221,6 +221,32 @@
                     </div>
                 </div>
 
+                <!-- 圆心确认面板 (人工兜底：先确认圆心，再识别环) -->
+                <div class="card" v-if="centerPhase === 'awaiting-center' && detectedCenter" style="border-left: 4px solid #f39c12;">
+                    <h3 style="color: #333; margin-bottom: 8px;">🎯 第一步：圆心确认</h3>
+                    <p style="font-size: 13px; color: #666; line-height: 1.6; margin-bottom: 10px;">
+                        已自动检测圆心，请在右侧图像中核对位置：可直接 <b>拖拽</b> 圆心、用 <b>方向键</b> 微调 (每次1px，Shift+方向键5px)，或输入精确坐标。按 <b>+/- 键</b> 可加长/减短圆心十字光标 (每次8px)，便于对准最内圈。确认无误后再进行圆环识别。
+                    </p>
+                    <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+                        <label style="font-size: 13px;">X:
+                            <input type="number" v-model.number="detectedCenter.x" step="1" style="width: 90px; padding: 6px; border: 1px solid #f39c12; border-radius: 4px; text-align: right;">
+                        </label>
+                        <label style="font-size: 13px;">Y:
+                            <input type="number" v-model.number="detectedCenter.y" step="1" style="width: 90px; padding: 6px; border: 1px solid #f39c12; border-radius: 4px; text-align: right;">
+                        </label>
+                        <button class="btn" style="width: auto; margin-top: 0; padding: 8px 18px;" :disabled="isProcessing" @click="confirmCenterAndDetectRings">✅ 确认圆心并识别环</button>
+                        <button class="btn" style="width: auto; margin-top: 0; padding: 8px 18px; background: #95a5a6;" :disabled="isProcessing" @click="redetectCenter">🔄 重新检测圆心</button>
+                    </div>
+                </div>
+
+                <!-- 环人工核对面板 (识别结束后：默认全勾选，可去除/改编号/补环) -->
+                <div class="card" v-if="centerPhase === 'done' && ringList.length > 0" style="border-left: 4px solid #764ba2;">
+                    <h3 style="color: #333; margin-bottom: 8px;">✋ 第二步：环人工核对</h3>
+                    <p style="font-size: 13px; color: #666; line-height: 1.6;">
+                        全部圆环默认勾选。<b>取消勾选</b> 可剔除识别错误的环 (重新勾选即恢复)，<b>编号</b> 可直接修改；若发现 <b>漏检</b> 的暗纹，直接在右侧图像上点击该位置即可补入。未勾选的环不参与表1/表2 计算与绘图。
+                    </p>
+                </div>
+
                 <!-- Control Panel -->
                 <div class="control-panel grid-auto" v-if="uploadedImage">
                     <!-- 图像预处理调试面板 -->
@@ -307,20 +333,39 @@
                     <h2 class="section-title">📊 测量结果</h2>
 
                     <!-- Diameter Table -->
-                    <h3 style="margin: 20px 0 10px 0; color: #555;">表1: 各暗环直径测量数据</h3>
+                    <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin: 20px 0 10px 0;">
+                        <h3 style="margin: 0; color: #555;">表1: 各暗环直径测量数据 <small style="color: #999;">(勾选 = 参与计算，编号可改)</small></h3>
+                        <!-- 取消勾选后的编号策略开关 (二选一)：保持原编号 / 顺延重排 -->
+                        <div style="display: flex; align-items: center; gap: 4px; font-size: 12px; color: #666; background: #fff; border: 1px solid #e0e0e0; border-radius: 6px; padding: 4px 10px;">
+                            <span style="font-weight: bold; color: #333;">取消勾选后编号:</span>
+                            <label style="cursor: pointer;"><input type="radio" v-model="renumberOnRemove" :value="false" @change="onRenumberModeChange"> 保持原编号</label>
+                            <label style="cursor: pointer;"><input type="radio" v-model="renumberOnRemove" :value="true" @change="onRenumberModeChange"> 顺延重排</label>
+                        </div>
+                    </div>
                     <div class="table-container card">
                         <table>
-                            <thead><tr><th>环编号 (k)</th><th>直径 (像素)</th><th>直径 (mm)</th></tr></thead>
+                            <thead><tr><th style="width: 60px;">启用</th><th>环编号 (k)</th><th>直径 (像素)</th><th>直径 (mm)</th></tr></thead>
                             <tbody>
-                                <tr v-if="diameterData.length === 0"><td colspan="3" style="padding: 40px;">📷 暂无测量数据，请上传图片并等待自动处理</td></tr>
-                                <tr v-for="item in diameterData" :key="item.number"
+                                <tr v-if="ringList.length === 0"><td colspan="4" style="padding: 40px;">📷 暂无测量数据，请上传图片并完成圆心确认</td></tr>
+                                <tr v-for="(item, index) in ringList" :key="index"
                                     class="tr"
-                                    :class="{ hovered: hoveredRing === item.number }"
-                                    @mouseenter="onTableRowHover(item.number)"
+                                    :class="{ hovered: item.enabled && hoveredRing === item.number }"
+                                    :style="{ opacity: item.enabled ? 1 : 0.45 }"
+                                    @mouseenter="item.enabled && onTableRowHover(item.number)"
                                     @mouseleave="onTableRowLeave()">
-                                    <td>{{ item.number }}</td>
-                                    <td>{{ item.diameterPixel.toFixed(2) }}</td>
-                                    <td>{{ item.diameterMM.toFixed(3) }}</td>
+                                    <td>
+                                        <input type="checkbox" v-model="item.enabled" @change="onToggleRingEnabled"
+                                               :title="item.enabled ? '取消勾选可剔除该环' : '重新勾选可恢复该环'"
+                                               style="width: 16px; height: 16px; cursor: pointer;">
+                                    </td>
+                                    <td>
+                                        <input type="number" min="1" step="1" v-model.number="item.number" @change="onRingNumberChange(item)"
+                                               :disabled="!item.enabled" title="可人工修改环编号"
+                                               style="width: 70px; padding: 4px; border: 1px solid #ccc; border-radius: 3px; text-align: center;">
+                                        <span v-if="item.manual" title="手动补入" style="color: #f39c12;">✍</span>
+                                    </td>
+                                    <td>{{ (item.avgRadius * 2).toFixed(2) }}</td>
+                                    <td>{{ (item.avgRadius * 2 * pixelScale).toFixed(3) }}</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -328,6 +373,13 @@
 
                     <!-- Radius Table -->
                     <h3 style="margin: 20px 0 10px 0; color: #555;">表2: 曲率半径计算结果</h3>
+                    <!-- 逐差法步长设置 (m-n)，默认 3，可人工修改，会话内保留 -->
+                    <div class="card" style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 12px 16px; margin-bottom: 10px;">
+                        <label style="font-weight: bold; color: #333;">逐差法步长 (m−n):</label>
+                        <input type="number" min="1" step="1" v-model.number="diffStep" @change="onDiffStepChange"
+                               title="分组为 D_m 与 D_{m-步长}，默认 3" style="width: 80px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; text-align: center;">
+                        <span style="font-size: 12px; color: #999;">默认 3，可人工修改；分组为 D<sub>m</sub> 与 D<sub>m−步长</sub>，修改后表2 与平均曲率半径自动重算</span>
+                    </div>
                     <div class="table-container card">
                         <table>
                             <thead><tr><th>分组</th><th>m</th><th>n</th><th>D<sub>m</sub>² - D<sub>n</sub>² (mm²)</th><th>曲率半径 R (m)</th></tr></thead>
@@ -514,6 +566,7 @@
             </div>
         </div>
     </div>
+
 
     <script src="js/lib/vue.global.js"></script>
     <script src="js/lib/opencv.js" async></script>

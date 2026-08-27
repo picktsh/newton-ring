@@ -7,7 +7,7 @@ export function clearCanvas(canvas) {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 }
 
-// 绘制检测结果到 Canvas
+// 绘制检测结果到 Canvas (未勾选的环不参与绘制)
 export function drawDetectionResults(canvasRef, imageManager) {
     const canvas = canvasRef.value;
     if (!canvas) return;
@@ -15,7 +15,8 @@ export function drawDetectionResults(canvasRef, imageManager) {
     if (!currentData || !currentData.detectedRings) return;
     const ctx = canvas.getContext('2d');
     const { originalWidth: imgWidth, originalHeight: imgHeight } = currentData;
-    const rings = currentData.detectedRings;
+    // 人工取消勾选的环 (enabled === false) 不绘制；旧数据无 enabled 字段视为启用
+    const rings = currentData.detectedRings.filter(r => r.enabled !== false);
     // Canvas 尺寸设置为原始图像尺寸，与坐标系统一致
     canvas.width = imgWidth;
     canvas.height = imgHeight;
@@ -24,6 +25,55 @@ export function drawDetectionResults(canvasRef, imageManager) {
     if (rings && rings.length > 0) {
         drawOverlay(ctx, rings, null);
     }
+}
+
+// 绘制圆心确认覆盖层 (圆心微调阶段：贯穿辅助线 + 十字 + 小圆 + 坐标标注；arm 为十字臂长，可用 +/- 键调节)
+export function drawCenterOverlay(canvasRef, center, width, height, arm = 24) {
+    const canvas = canvasRef.value;
+    if (!canvas || !center) return;
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, width, height);
+    const { x, y } = center;
+    // 贯穿全图的橙色辅助线 (低透明度，便于判断圆心是否在各环中心)
+    ctx.strokeStyle = 'rgba(255, 165, 0, 0.45)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(width, y);
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, height);
+    ctx.stroke();
+    // 中心十字 + 小圆 (臂长 arm 可调，便于对准不同尺寸的最内圈；亮绿色更醒目)
+    const CURSOR_COLOR = 'rgba(0, 230, 118, 1)'; // #00E676 亮绿色
+    ctx.strokeStyle = CURSOR_COLOR;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(x - arm, y);
+    ctx.lineTo(x + arm, y);
+    ctx.moveTo(x, y - arm);
+    ctx.lineTo(x, y + arm);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(x, y, 6, 0, Math.PI * 2);
+    ctx.stroke();
+    // 过十字四端点的虚线圆 (半径 = 臂长，随 +/- 键放大缩小，便于判断光标是否贴合最内圈)
+    ctx.setLineDash([6, 6]);
+    ctx.beginPath();
+    ctx.arc(x, y, arm, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // 坐标标注 (带黑色描边便于辨认)
+    ctx.font = 'bold 13px Arial';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'bottom';
+    const text = `圆心 (${Math.round(x)}, ${Math.round(y)})`;
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(0, 0, 0, 0.8)';
+    ctx.strokeText(text, x + 10, y - 8);
+    ctx.fillStyle = CURSOR_COLOR;
+    ctx.fillText(text, x + 10, y - 8);
 }
 
 // 绘制暗环覆盖层 (包括中心十字、轮廓、标签)

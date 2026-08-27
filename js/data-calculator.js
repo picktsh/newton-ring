@@ -12,8 +12,8 @@ export function calculateDiameterData(detectedRings, pixelScale) {
     }));
 }
 
-// 计算曲率半径 (使用逐差法)
-export function calculateRadiusData(detectedRings, pixelScale) {
+// 计算曲率半径 (使用逐差法，步长 m-n 可人工调节，默认 3)
+export function calculateRadiusData(detectedRings, pixelScale, step = 3) {
     if (!detectedRings || detectedRings.length === 0) {
         return [];
     }
@@ -21,9 +21,10 @@ export function calculateRadiusData(detectedRings, pixelScale) {
     let totalRadius = 0;
     let validGroups = 0;
     const sortedRings = [...detectedRings].sort((a, b) => b.avgRadius - a.avgRadius);
-    const maxRingNumber = sortedRings.length;
-    // 动态生成分组配置
-    const dynamicGroups = generateDynamicGroups(maxRingNumber);
+    // 人工可修改编号且去除环后保持原编号，分组范围以最大编号为准 (而非环数)
+    const maxRingNumber = Math.max(...sortedRings.map(r => r.number));
+    // 动态生成分组配置 (步长由人工指定)
+    const dynamicGroups = generateDynamicGroups(maxRingNumber, step);
     dynamicGroups.forEach(group => {
         const ringM = detectedRings.find(r => r.number === group.m);
         const ringN = detectedRings.find(r => r.number === group.n);
@@ -50,15 +51,13 @@ export function calculateRadiusData(detectedRings, pixelScale) {
     return results;
 }
 
-// 动态生成分组配置 (固定差值为3)
-function generateDynamicGroups(maxRingNumber) {
-    if (maxRingNumber < 4) {
+// 动态生成分组配置 (步长可调，默认 3)
+function generateDynamicGroups(maxRingNumber, step = 3) {
+    if (maxRingNumber < step + 1) {
         return [];
     }
     const groups = [];
-    // 固定差值为3
-    const step = 3;
-    for (let m = maxRingNumber; m >= 4; m--) {
+    for (let m = maxRingNumber; m >= step + 1; m--) {
         const n = m - step;
         if (n >= 1) {
             groups.push({ m, n });

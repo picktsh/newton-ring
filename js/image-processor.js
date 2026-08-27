@@ -1,13 +1,44 @@
 // @ts-ignore
 /* global Vue, cv */
 
-// 主处理函数：检测牛顿环暗环
+// 提取单环完整数据并编号 (供点击补环复用)
+export function extractRingDataForManual(grayMat, centerX, centerY, radius) {
+  return extractRingData(grayMat, centerX, centerY, radius);
+}
+
+// 主处理函数：检测牛顿环暗环 (两步式：先检测圆心供人工确认，再识别环)
 export async function processNewtonRings(
   imageManager,
   showStatus,
   filterParams = null,
   resultImageRef = null
 ) {
+  // 第一步：检测圆心 (自动识别，供人工确认/微调)
+  const centerResult = await detectNewtonRingCenter(imageManager, showStatus, filterParams, resultImageRef);
+  if (!centerResult) {
+    throw new Error('无法检测到牛顿环中心，请检查图像质量');
+  }
+  // 第二步：圆心确认后识别环 (复用已预处理的图像)
+  const darkRings = await detectRingsWithCenter(
+    imageManager,
+    showStatus,
+    centerResult.x,
+    centerResult.y,
+    centerResult.processedDataUrl,
+    centerResult.outerRadius,
+    resultImageRef
+  );
+
+  if (darkRings.length === 0) {
+    throw new Error('未检测到暗环，请调整图像参数后重试');
+  }
+
+  showStatus(`[100%] 完成！检测到 ${darkRings.length} 个暗环`, 'success');
+}
+
+// 第一步：预处理图像 + 自动检测圆心 (供人工确认，不识别环)
+// 返回 { x, y, outerRadius, processedDataUrl }，预处理图以 DataURL 缓存供第二步复用，避免重复预处理
+export async function detectNewtonRingCenter(imageManager, showStatus, filterParams = null, resultImageRef = null) {
   showStatus('[10%] 正在读取图像...', 'info');
 
   const originalImageUrl = imageManager.getOriginalImageSrc();
@@ -23,100 +54,108 @@ export async function processNewtonRings(
   });
 
   const src = cv.imread(originalImg);
-
-  await showDebugImage('原始图像', src, resultImageRef);
-  showStatus('[20%] 正在预处理图像...', 'info');
-  await new Promise(resolve => requestAnimationFrame(resolve));
-
   let gray = null;
+  let enhancedGray = null;
+  let denoisedGray = null;
   try {
-    // 转换为灰度图
+    showStatus('[20%] 正在预处理图像...', 'info');
+    await new Promise(resolve => requestAnimationFrame(resolve));
+
     gray = convertToGray(src);
     await showDebugImage('灰度图', gray, resultImageRef);
 
-    showStatus('[40%] 正在检测暗环轮廓...', 'info');
+    showStatus('[40%] 正在检测圆心...', 'info');
     await new Promise(resolve => requestAnimationFrame(resolve));
     // CLAHE 对比度增强 (降低参数避免过度增强噪声)
-    const enhancedGray = applyCLAHE(gray, 1.5, 16);
+    enhancedGray = applyCLAHE(gray, 1.5, 16);
     await showDebugImage('CLAHE对比度增强', enhancedGray, resultImageRef);
 
     // 中值滤波去噪 (比高斯模糊更适合保留边缘)
-    const denoisedGray = applyMedianBlur(enhancedGray, 3);
+    denoisedGray = applyMedianBlur(enhancedGray, 3);
     await showDebugImage('中值滤波去噪', denoisedGray, resultImageRef);
 
-    // 检测牛顿环暗环 (直接用灰度图做径向剖面)
-    const darkRings = await detectNewtonRings(gray, denoisedGray, resultImageRef);
+    // 用霍夫圆检测外边界获取精确圆心 (含径向对称性精修)
+    const center = findCenterFromHough(denoisedGray);
+    console.log(`检测到圆心: (${center.x.toFixed(1)}, ${center.y.toFixed(1)}), 外半径: ${center.outerRadius.toFixed(1)}`);
 
-
-    if (darkRings.length === 0) {
-      throw new Error('未检测到暗环，请调整图像参数后重试');
+    if (center.x === 0 && center.y === 0) {
+      return null;
     }
 
-    showStatus(`[60%] 检测到 ${darkRings.length} 个暗环，正在处理...`, 'info');
-    await new Promise(resolve => requestAnimationFrame(resolve));
+    // 调试：在预处理图上标注圆心与外边界，供人工目检确认
+    const debugColor = new cv.Mat();
+    cv.cvtColor(denoisedGray, debugColor, cv.COLOR_GRAY2BGR);
+    const centerColor = new cv.Scalar(0, 0, 255, 255);
+    cv.circle(debugColor, new cv.Point(center.x, center.y), 8, centerColor, 2);
+    cv.line(debugColor, new cv.Point(center.x - 30, center.y), new cv.Point(center.x + 30, center.y), centerColor, 1);
+    cv.line(debugColor, new cv.Point(center.x, center.y - 30), new cv.Point(center.x, center.y + 30), centerColor, 1);
+    const outerColor = new cv.Scalar(255, 165, 0, 255);
+    cv.circle(debugColor, new cv.Point(center.x, center.y), Math.round(center.outerRadius), outerColor, 2);
+    // 保存含标注的调试图并转 DataURL 缓存，供第二步复用预处理结果 (不再重复预处理)
+    await showDebugImage('圆心检测结果 (请确认)', debugColor, resultImageRef);
+    const processedDataUrl = resultImageRef?.value?.src || null;
+    debugColor.delete();
 
-    console.log(`检测结果 - 中心点: (${darkRings[0].x.toFixed(1)}, ${darkRings[0].y.toFixed(1)}), 暗环数量: ${darkRings.length}`);
+    showStatus(`✅ 圆心检测完成: (${center.x.toFixed(1)}, ${center.y.toFixed(1)})，请确认或微调`, 'success');
 
-    showStatus(`[80%] 成功检测 ${darkRings.length} 个暗环，保存结果...`, 'info');
-    await new Promise(resolve => requestAnimationFrame(resolve));
-
-    imageManager.saveCurrentResultToCache(darkRings);
-
-    showStatus('[100%] 完成！', 'success');
-
-    denoisedGray?.delete?.();
-    enhancedGray?.delete?.();
+    return {
+      x: center.x,
+      y: center.y,
+      outerRadius: center.outerRadius,
+      processedDataUrl
+    };
   } finally {
     src?.delete?.();
     gray?.delete?.();
+    enhancedGray?.delete?.();
+    denoisedGray?.delete?.();
   }
 }
 
+// 第二步：在确认后的圆心位置识别暗环 (径向剖面法)
+// processedDataUrl 为第一步缓存的预处理图，为空时退化为从原图重新预处理 (尺寸不变时坐标一致)
+export async function detectRingsWithCenter(imageManager, showStatus, centerX, centerY, processedDataUrl, outerRadius = 0, resultImageRef = null) {
+  showStatus('[60%] 正在识别暗环...', 'info');
+  await new Promise(resolve => requestAnimationFrame(resolve));
 
-// 检测牛顿环 (圆心定位 + 径向剖面法)
-async function detectNewtonRings(grayMat, processedMat, resultImageRef) {
+  // 加载预处理图 (含标注也无妨，径向剖面取灰度值；若含彩色标注则转灰度后影响极小)
+  const img = await new Promise((resolve, reject) => {
+    const el = new Image();
+    el.onload = () => resolve(el);
+    el.onerror = () => reject(new Error('预处理图像加载失败'));
+    el.src = processedDataUrl;
+  });
+  let srcMat = cv.imread(img);
+  if (srcMat.channels() > 1) {
+    const tmp = new cv.Mat();
+    cv.cvtColor(srcMat, tmp, cv.COLOR_BGR2GRAY);
+    srcMat.delete();
+    srcMat = tmp;
+  }
+
+  let darkRings = [];
   try {
-    const rows = processedMat.rows;
-    const cols = processedMat.cols;
+    // 搜索范围限制到外边界 (无外边界时退化为图片短边的 48%)
+    const fallback = Math.min(srcMat.cols, srcMat.rows) * 0.48;
+    const maxRadius = outerRadius > 0 ? outerRadius * 0.98 : fallback;
 
-    console.log(`开始牛顿环检测 - 图像尺寸: ${cols}x${rows}`);
-    // 用霍夫圆检测外边界获取精确圆心
-    const center = findCenterFromHough(processedMat);
-    const centerX = center.x;
-    const centerY = center.y;
-    const maxRadius = center.outerRadius * 0.98;
+    darkRings = detectDarkRingsRadial(srcMat, centerX, centerY, maxRadius);
 
-    console.log(`检测到圆心: (${centerX.toFixed(1)}, ${centerY.toFixed(1)}), 外半径: ${center.outerRadius.toFixed(1)}`);
-    // 调试：显示圆心位置
-    const debugColor = new cv.Mat();
-    cv.cvtColor(processedMat, debugColor, cv.COLOR_GRAY2BGR);
-    const centerColor = new cv.Scalar(0, 0, 255, 255);
-    cv.circle(debugColor, new cv.Point(centerX, centerY), 8, centerColor, 2);
-    cv.line(debugColor, new cv.Point(centerX - 30, centerY), new cv.Point(centerX + 30, centerY), centerColor, 1);
-    cv.line(debugColor, new cv.Point(centerX, centerY - 30), new cv.Point(centerX, centerY + 30), centerColor, 1);
-    // 画外边界圆
-    const outerColor = new cv.Scalar(255, 165, 0, 255);
-    cv.circle(debugColor, new cv.Point(centerX, centerY), Math.round(center.outerRadius), outerColor, 2);
-    await showDebugImage('圆心检测结果', debugColor, resultImageRef);
-    debugColor.delete();
-
-    if (centerX === 0 || centerY === 0) {
-      throw new Error('无法检测到牛顿环中心，请检查图像质量');
-    }
-    // 径向剖面法检测暗环
-    const darkRings = detectDarkRingsRadial(processedMat, centerX, centerY, maxRadius);
-
-    console.log(`检测结果 - 暗环数量: ${darkRings.length}`);
+    console.log(`检测结果 - 圆心(${centerX.toFixed(1)}, ${centerY.toFixed(1)}), 暗环数量: ${darkRings.length}`);
     if (darkRings.length > 0) {
       console.log(`暗环半径: ${darkRings.map(r => `环${r.number}: ${r.avgRadius.toFixed(1)}`).join(', ')}`);
     }
 
-    return darkRings;
+    showStatus(`[80%] 成功检测 ${darkRings.length} 个暗环，保存结果...`, 'info');
+    await new Promise(resolve => requestAnimationFrame(resolve));
 
-  } catch (error) {
-    console.error('牛顿环检测失败:', error);
-    return [];
+    // 圆心随结果一并缓存 (供人工核对/重新识别复用)
+    imageManager.saveCurrentResultToCache(darkRings, { x: centerX, y: centerY });
+  } finally {
+    srcMat?.delete?.();
   }
+
+  return darkRings;
 }
 
 // 用霍夫圆检测外边界获取精确圆心
@@ -216,7 +255,93 @@ function findCenterFromHough(grayMat) {
   }
 
   console.log(`精修后圆心: (${refinedCx.toFixed(1)}, ${refinedCy.toFixed(1)}), 外半径: ${bestR.toFixed(1)}`);
+
+  // 步骤4: 中心斑质心精修 —— 牛顿环中心最内圈有一块暗斑或亮斑，圆心应在该斑点几何中心居中；
+  // 检测不到明显中心斑时回退径向对称性精修结果，不阻断流程 (人工确认阶段仍可微调)
+  const spotCenter = refineCenterOnCentralSpot(grayMat, refinedCx, refinedCy, bestR);
+  if (spotCenter) {
+    console.log(`中心斑质心精修: (${refinedCx.toFixed(1)},${refinedCy.toFixed(1)}) → (${spotCenter.x.toFixed(1)},${spotCenter.y.toFixed(1)})，斑点类型: ${spotCenter.dark ? '暗斑' : '亮斑'}，半径 ≈ ${spotCenter.spotRadius.toFixed(1)}px`);
+    refinedCx = spotCenter.x;
+    refinedCy = spotCenter.y;
+  } else {
+    console.log('未检测到明显中心斑，保留径向对称性精修结果');
+  }
+
   return { x: refinedCx, y: refinedCy, outerRadius: bestR };
+}
+
+// 中心斑质心精修：自动判断中心是暗斑还是亮斑，用极值加权质心把圆心收敛到斑点几何中心 (亚像素)。
+// 检测不到明显斑点 (对比度太弱/形状异常/偏移过大) 时返回 null，调用方回退现有精修结果。
+function refineCenterOnCentralSpot(grayMat, coarseCx, coarseCy, outerRadius) {
+  const cols = grayMat.cols;
+  const rows = grayMat.rows;
+  if (coarseCx < 2 || coarseCy < 2 || coarseCx >= cols - 2 || coarseCy >= rows - 2) return null;
+
+  // 1) 估计斑点半径与中心/背景亮度：沿 12 方向取平均径向剖面，找中心与外圈亮度跨越中点的位置 (自动兼容暗斑/亮斑)
+  const numA = 12;
+  const step = 0.5;
+  const limit = Math.min(Math.max(outerRadius * 0.25, 12), 120);
+  const profile = [];
+  for (let r = 0; r <= limit; r += step) {
+    let sum = 0, cnt = 0;
+    for (let a = 0; a < numA; a++) {
+      const ang = (a * 2 * Math.PI) / numA;
+      const v = bilinearInterpolate(grayMat, coarseCx + r * Math.cos(ang), coarseCy + r * Math.sin(ang));
+      if (v >= 0) { sum += v; cnt++; }
+    }
+    profile.push(cnt > 0 ? sum / cnt : null);
+  }
+  const head = profile.slice(0, 4).filter(v => v !== null);
+  const tail = profile.slice(-6).filter(v => v !== null);
+  if (head.length === 0 || tail.length === 0) return null;
+  const centerVal = head.reduce((s, v) => s + v, 0) / head.length;
+  const bgVal = tail.reduce((s, v) => s + v, 0) / tail.length;
+  const contrast = Math.abs(bgVal - centerVal);
+  if (contrast < 12) return null; // 斑点与背景对比度太弱，无法可靠定位 (回退)
+  const isDark = centerVal < bgVal;
+
+  const midVal = (centerVal + bgVal) / 2;
+  let spotRadius = 0;
+  for (let i = 1; i < profile.length; i++) {
+    if (profile[i] === null || profile[i - 1] === null) continue;
+    const crossed = isDark ? (profile[i - 1] < midVal && profile[i] >= midVal) : (profile[i - 1] > midVal && profile[i] <= midVal);
+    if (crossed) { spotRadius = i * step; break; }
+  }
+  if (spotRadius < 2) spotRadius = Math.min(limit / 2, 10);
+
+  // 2) 极值加权质心迭代：暗斑权重 = 背景 - 亮度，亮斑权重 = 亮度 - 背景，收敛到斑点几何中心；
+  //    采样限定在斑点半径内 (窗口外的相邻亮环在暗斑权重公式下同样为正权重，会把质心拉偏)；
+  //    每轮以上一轮质心为中心重新采样，自适应斑点实际位置。
+  let cx = coarseCx, cy = coarseCy;
+  for (let iter = 0; iter < 3; iter++) {
+    const win = spotRadius;
+    // 以当前候选中心重估剖面，确定本轮权重参考的背景亮度与斑点亮度方向基准是否仍成立 (自适应偏移)
+    let sumX = 0, sumY = 0, sumW = 0;
+    const x0 = Math.max(1, Math.floor(cx - win)), x1 = Math.min(cols - 2, Math.ceil(cx + win));
+    const y0 = Math.max(1, Math.floor(cy - win)), y1 = Math.min(rows - 2, Math.ceil(cy + win));
+    for (let y = y0; y <= y1; y++) {
+      for (let x = x0; x <= x1; x++) {
+        if ((x - cx) * (x - cx) + (y - cy) * (y - cy) > win * win) continue;
+        const v = grayMat.ucharAt(y, x);
+        const w = isDark ? bgVal - v : v - bgVal;
+        if (w > 0) {
+          sumX += x * w;
+          sumY += y * w;
+          sumW += w;
+        }
+      }
+    }
+    if (sumW <= 0) return null;
+    const nx = sumX / sumW, ny = sumY / sumW;
+    // 质心跳出斑点窗口太多：候选点不在斑内 (形状异常/误检)，回退
+    if (Math.hypot(nx - cx, ny - cy) > win) return null;
+    cx = nx;
+    cy = ny;
+  }
+
+  // 最终圆心不得偏离粗定位过多 (防止亮斑/异常区域把圆心拉飞)
+  if (Math.hypot(cx - coarseCx, cy - coarseCy) > Math.max(spotRadius * 2, 25)) return null;
+  return { x: cx, y: cy, dark: isDark, spotRadius };
 }
 
 // 备选：亮度加权质心
@@ -533,11 +658,16 @@ function clusterRadiiByPhysics(minima, numAngles) {
 }
 
 // 排序暗环并编号 (从小到大)
-function sortRings(rings) {
+export function sortRings(rings) {
   if (!rings || rings.length === 0) return [];
   rings.sort((a, b) => a.avgRadius - b.avgRadius);
   rings.forEach((ring, index) => ring.number = index + 1);
   return rings;
+}
+
+// 合并自动检测环与手动补环，按半径重新排序编号 (供点击补环使用)
+export function mergeAndNumberRings(rings) {
+  return sortRings([...(rings || [])]);
 }
 
 // 提取暗环完整数据 (关键点、椭圆拟合)

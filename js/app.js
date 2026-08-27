@@ -2,10 +2,10 @@
 /* global Vue, cv */
 
 import { createImageManager } from './image-manager.js';
-import { processNewtonRings } from './image-processor.js';
-import { initCanvasInteraction, onTableRowHover, onTableRowLeave, initDragDrop } from './interaction-handler.js';
+import { detectNewtonRingCenter, detectRingsWithCenter, mergeAndNumberRings, extractRingDataForManual } from './image-processor.js';
+import { initCanvasInteraction, onTableRowHover, onTableRowLeave, initDragDrop, initCenterAdjustInteraction } from './interaction-handler.js';
 import { calculateDiameterData, calculateRadiusData, calculateAverageRadius, generateCalculationResults } from './data-calculator.js';
-import { drawDetectionResults, clearCanvas } from './canvas-drawer.js';
+import { drawDetectionResults, clearCanvas, drawCenterOverlay } from './canvas-drawer.js';
 
 const { ref, reactive, computed, onMounted, nextTick, watch } = Vue;
 
@@ -141,6 +141,14 @@ export default {
         const fileInputRef = ref(null);
         const logContainerRef = ref(null);
         const resultImageSrcRef = ref('');
+        // ===== 两步确认流程状态 =====
+        // 'idle' 未开始 | 'awaiting-center' 待确认圆心 | 'done' 已识别环 (进入人工核对)
+        const centerPhase = ref('idle');
+        const detectedCenter = ref(null);          // { x, y } 当前圆心 (可人工微调)
+        const centerCrossArm = ref(24);            // 圆心十字光标臂长 (px)，可用 +/- 键调节，范围 8~200
+        const centerProcessedDataUrl = ref(null);  // 第一步预处理图缓存 (供识别环/补环复用)
+        const detectedOuterRadius = ref(0);        // 外边界半径 (环搜索上限)
+        let cleanupCenterAdjust = null;            // 圆心拖拽交互清理函数
         // 当前选中的图片数据
         const currentImageData = computed(() => {
             return imageManager.getCurrentImageData();
@@ -149,15 +157,35 @@ export default {
         const originalImageSrcRef = computed(() => {
             return imageManager.getOriginalImageSrc();
         });
-        // 直径测量数据
-        const diameterData = computed(() => {
+        // ===== 环人工核对：默认全部勾选，可取消勾选去除、可改编号 =====
+        // 映射副本：旧数据无 enabled 字段视为启用 (默认全选)
+        const ringList = computed(() => {
             const rings = currentImageData.value?.detectedRings || [];
-            return calculateDiameterData(rings, pixelScale.value);
+            return rings.map(r => ({ ...r, enabled: r.enabled !== false }));
         });
-        // 曲率半径计算结果
+        const enabledRings = computed(() => ringList.value.filter(r => r.enabled));
+        const manualRingCount = computed(() => ringList.value.filter(r => r.manual).length);
+        // 取消勾选后的编号策略：默认 false = 保持原编号；true = 启用环按半径顺延重排 1..N (会话内保留)
+        const renumberOnRemove = ref(false);
+        // 逐差法步长 (m-n)：默认 3，可人工修改；组件级状态，切换图片保留，刷新页面恢复默认 (会话内保留)
+        const diffStep = ref(3);
+        // 步长输入校验：须为不小于 1 的整数，非法值还原为 3 并提示 (响应式自动重算表2)
+        function onDiffStepChange() {
+            const s = Math.round(Number(diffStep.value));
+            if (!Number.isFinite(s) || s < 1) {
+                showStatus('⚠️ 逐差法步长需为不小于 1 的整数，已还原为 3', 'info');
+                diffStep.value = 3;
+            } else {
+                diffStep.value = s;
+            }
+        }
+        // 直径测量数据 (仅启用环参与)
+        const diameterData = computed(() => {
+            return calculateDiameterData(enabledRings.value, pixelScale.value);
+        });
+        // 曲率半径计算结果 (仅启用环参与，步长可人工调节)
         const radiusData = computed(() => {
-            const rings = currentImageData.value?.detectedRings || [];
-            return calculateRadiusData(rings, pixelScale.value);
+            return calculateRadiusData(enabledRings.value, pixelScale.value, diffStep.value);
         });
         // 平均曲率半径
         const averageRadius = computed(() => {
@@ -251,8 +279,9 @@ export default {
         function onCalibClickA(e) { onCalibClick('A', e); }
         function onCalibClickB(e) { onCalibClick('B', e); }
 
-        // 键盘方向键微调标记点
+        // 键盘方向键微调标定标记 (仅标定页生效，避免与圆心微调冲突)
         function onCalibKeydown(e) {
+            if (activeTab.value !== 'calibration') return;
             const slot = calibActiveSlot.value;
             const point = slot === 'A' ? calibPointA.value : calibPointB.value;
             if (!point) return;
@@ -401,7 +430,7 @@ export default {
             setTimeout(() => processImage(), 300);
         }
 
-        // OpenCV 图像处理主函数
+        // OpenCV 图像处理主函数 (第一步：自动检测圆心，等待人工确认)
         async function processImage() {
             if (!imageManager.uploadedImage.value || !cvReady.value) {
                 return showStatus('❌ 请先上传图像并等待 OpenCV 加载', 'error');
@@ -412,26 +441,36 @@ export default {
 
             isProcessing.value = true;
             try {
-                // 清空上次检测结果
+                // 重置流程状态与上次检测结果
+                cleanupCenterAdjust?.();
+                cleanupCenterAdjust = null;
+                centerPhase.value = 'idle';
+                detectedCenter.value = null;
+                centerProcessedDataUrl.value = null;
+                detectedOuterRadius.value = 0;
                 resultImageSrcRef.value = null;
                 clearCanvas(resultCanvasRef.value);
                 const fingerprint = imageManager.currentFingerprint.value;
                 if (fingerprint) {
                     sessionStorage.removeItem('calc_' + fingerprint);
                 }
-                // 调用图像处理核心函数
-                await processNewtonRings(
+                // 第一步：预处理 + 自动检测圆心 (不识别环，先供人工确认)
+                const centerResult = await detectNewtonRingCenter(
                     imageManager,
                     showStatus,
                     filterParams,
                     resultImageRef
                 );
-                // 处理完成后，绘制结果和初始化交互
-                nextTick(() => {
-                    drawDetectionResults(resultCanvasRef, imageManager);
-                    initCanvasInteractionWrapper();
+                if (!centerResult) {
+                    showStatus('❌ 无法检测到牛顿环中心，请检查图像质量', 'error');
                     resultImageSrcRef.value = imageManager.getOriginalImageSrc();
-                });
+                    return;
+                }
+                detectedCenter.value = { x: Math.round(centerResult.x), y: Math.round(centerResult.y) };
+                detectedOuterRadius.value = centerResult.outerRadius;
+                centerProcessedDataUrl.value = centerResult.processedDataUrl;
+                enterAwaitingCenterPhase();
+                showStatus('🔍 请核对圆心：可拖拽/方向键微调/输入坐标，确认后再识别环', 'info');
             } catch (error) {
                 console.error('处理错误:', error);
                 showStatus(`❌ 处理失败: ${error.message}`, 'error');
@@ -441,14 +480,232 @@ export default {
             }
         }
 
-        // Canvas交互包装函数
-        function initCanvasInteractionWrapper() {
-            initCanvasInteraction(resultImageRef, resultCanvasRef, imageManager, hoveredRingRef);
+        // 进入圆心待确认阶段：画圆心覆盖层 + 启用拖拽微调
+        function enterAwaitingCenterPhase() {
+            centerPhase.value = 'awaiting-center';
+            nextTick(() => {
+                cleanupCenterAdjust?.();
+                cleanupCenterAdjust = initCenterAdjustInteraction(resultImageRef, resultCanvasRef, (newCenter) => {
+                    detectedCenter.value = newCenter;
+                });
+            });
         }
 
-        // 从缓存恢复显示
+        // 圆心变化 (拖拽/键盘/输入框) 或十字臂长变化 (+/- 键) 时重绘覆盖层 (由 watch 统一处理)
+        watch([detectedCenter, centerCrossArm], () => {
+            if (centerPhase.value !== 'awaiting-center' || !detectedCenter.value) return;
+            const img = imageManager.uploadedImage.value;
+            drawCenterOverlay(resultCanvasRef, detectedCenter.value, img?.width || 0, img?.height || 0, centerCrossArm.value);
+        }, { deep: true });
+
+        // 第二步：确认圆心并识别暗环 (人工兜底完成后的入口)
+        async function confirmCenterAndDetectRings() {
+            if (!detectedCenter.value || isProcessing.value) return;
+            isProcessing.value = true;
+            try {
+                cleanupCenterAdjust?.();
+                cleanupCenterAdjust = null;
+                const darkRings = await detectRingsWithCenter(
+                    imageManager,
+                    showStatus,
+                    detectedCenter.value.x,
+                    detectedCenter.value.y,
+                    centerProcessedDataUrl.value,
+                    detectedOuterRadius.value,
+                    resultImageRef
+                );
+                if (darkRings.length === 0) {
+                    showStatus('⚠️ 未检测到暗环，请微调圆心或调整预处理参数后重试', 'error');
+                    enterAwaitingCenterPhase();
+                    return;
+                }
+                centerPhase.value = 'done';
+                showStatus(`✅ 识别到 ${darkRings.length} 个暗环，可在下方表格去除错环/改编号，或点击图像补环`, 'success');
+                // 处理完成后，绘制结果和初始化交互 (底图恢复为原图，标记层覆盖绘制)
+                nextTick(() => {
+                    drawDetectionResults(resultCanvasRef, imageManager);
+                    initCanvasInteractionWrapper();
+                    resultImageSrcRef.value = imageManager.getOriginalImageSrc();
+                });
+            } catch (error) {
+                console.error('环识别失败:', error);
+                showStatus(`❌ 环识别失败: ${error.message}`, 'error');
+                enterAwaitingCenterPhase();
+            } finally {
+                isProcessing.value = false;
+            }
+        }
+
+        // 重新检测圆心 (放弃当前微调结果)
+        async function redetectCenter() {
+            if (isProcessing.value) return;
+            cleanupCenterAdjust?.();
+            cleanupCenterAdjust = null;
+            await processImage();
+        }
+
+        // 键盘方向键微调圆心 (圆心确认阶段；Shift+方向键 = 5px；+/- 键调节十字光标臂长)
+        function onCenterKeydown(e) {
+            if (centerPhase.value !== 'awaiting-center' || activeTab.value !== 'rings') return;
+            if (!detectedCenter.value) return;
+            // 输入框聚焦时不拦截按键，避免影响坐标输入等操作
+            if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
+            // +/- 键加长/减短圆心十字光标臂长 (每次 8px，范围 8~200)
+            if (e.key === '+' || e.key === '=' || e.key === '-' || e.key === '_') {
+                e.preventDefault();
+                const delta = (e.key === '+' || e.key === '=') ? 8 : -8;
+                centerCrossArm.value = Math.max(8, Math.min(200, centerCrossArm.value + delta));
+                return;
+            }
+            const step = e.shiftKey ? 5 : 1;
+            let dx = 0, dy = 0;
+            switch (e.key) {
+                case 'ArrowUp': dy = -step; break;
+                case 'ArrowDown': dy = step; break;
+                case 'ArrowLeft': dx = -step; break;
+                case 'ArrowRight': dx = step; break;
+                default: return;
+            }
+            e.preventDefault();
+            const img = imageManager.uploadedImage.value;
+            const maxX = (img?.width || 1) - 1;
+            const maxY = (img?.height || 1) - 1;
+            detectedCenter.value = {
+                x: Math.max(0, Math.min(maxX, detectedCenter.value.x + dx)),
+                y: Math.max(0, Math.min(maxY, detectedCenter.value.y + dy))
+            };
+        }
+
+        // ===== 环人工核对操作 =====
+        // 将当前环列表 (含勾选状态/编号修改) 写回缓存并重绘 (仅启用环参与绘制与计算)
+        function persistRings() {
+            const rings = ringList.value;
+            if (rings.length === 0) return;
+            const center = detectedCenter.value || currentImageData.value?.center || null;
+            imageManager.saveCurrentResultToCache(rings, center);
+            nextTick(() => drawDetectionResults(resultCanvasRef, imageManager));
+        }
+
+        // 勾选/取消勾选某环 (取消即从计算/绘图/导出中剔除，重新勾选可恢复)
+        function onToggleRingEnabled() {
+            // 顺延重排模式：启用环按半径顺序重新编号 1..N (会覆盖手动改过的编号)
+            if (renumberOnRemove.value) {
+                renumberEnabledRings();
+            }
+            persistRings();
+        }
+
+        // 顺延重排：启用环按半径从小到大编号 1..N；未启用环保留原编号 (仅显示，不参与计算)
+        function renumberEnabledRings() {
+            const enabled = ringList.value.filter(r => r.enabled).sort((a, b) => a.avgRadius - b.avgRadius);
+            enabled.forEach((r, i) => { r.number = i + 1; });
+        }
+
+        // 编号策略开关变更 (二选一：保持原编号 / 顺延重排)；切到顺延模式立即对当前编号生效 (切换即生效)
+        function onRenumberModeChange() {
+            if (renumberOnRemove.value) {
+                renumberEnabledRings();
+                persistRings();
+                showStatus('✅ 已切换为顺延重排：启用环已按半径重新编号 1..N (手动编号已被覆盖)', 'success');
+            } else {
+                showStatus('✅ 已切换为保持原编号：取消勾选不再改变其余环编号', 'info');
+            }
+        }
+
+        // 修改环序号编号 (需为不小于 1 的整数；去除环后保持原编号不重排)
+        function onRingNumberChange(ring) {
+            const n = Math.round(Number(ring.number));
+            if (!Number.isFinite(n) || n < 1) {
+                showStatus('⚠️ 编号需为不小于 1 的整数，已还原', 'info');
+                imageManager.dataVersion.value++;
+                return;
+            }
+            ring.number = n;
+            const dup = ringList.value.filter(r => r.enabled && r.number === n).length;
+            if (dup > 1) showStatus(`⚠️ 编号 ${n} 重复，曲率分组计算可能异常，请检查`, 'info');
+            persistRings();
+        }
+
+        // 加载预处理灰度图 (供点击补环提取实测环数据)
+        async function loadPreprocessedGrayMat() {
+            const url = centerProcessedDataUrl.value;
+            if (!url) return null;
+            try {
+                const img = await new Promise((resolve, reject) => {
+                    const el = new Image();
+                    el.onload = () => resolve(el);
+                    el.onerror = reject;
+                    el.src = url;
+                });
+                let mat = cv.imread(img);
+                if (mat.channels() > 1) {
+                    const tmp = new cv.Mat();
+                    cv.cvtColor(mat, tmp, cv.COLOR_BGR2GRAY);
+                    mat.delete();
+                    mat = tmp;
+                }
+                return mat;
+            } catch (err) {
+                console.warn('预处理图加载失败:', err);
+                return null;
+            }
+        }
+
+        // 点击图像手动补环 (识别结束后的人工兜底：漏检的暗纹点一下即可补入)
+        async function completeRingAtClick(event) {
+            if (centerPhase.value !== 'done') return;
+            const imgEl = resultImageRef.value;
+            const canvas = resultCanvasRef.value;
+            if (!imgEl || !canvas) return;
+            const center = detectedCenter.value || currentImageData.value?.center;
+            if (!center) return;
+            // 显示坐标 → 原始图像像素坐标 (与悬停检测同口径)
+            const rect = imgEl.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            const px = (event.clientX - rect.left) * scaleX;
+            const py = (event.clientY - rect.top) * scaleY;
+            const radius = Math.sqrt(Math.pow(px - center.x, 2) + Math.pow(py - center.y, 2));
+            if (radius < 5) {
+                showStatus('⚠️ 点击位置距圆心太近，无法补环', 'info');
+                return;
+            }
+            // 用预处理图提取该半径处的实测数据 (关键点/椭圆拟合)
+            const grayMat = await loadPreprocessedGrayMat();
+            if (!grayMat) {
+                showStatus('⚠️ 预处理图已失效，请点击“重新处理”后再补环', 'info');
+                return;
+            }
+            const ring = extractRingDataForManual(grayMat, center.x, center.y, radius);
+            grayMat.delete();
+            if (!ring) {
+                showStatus('❌ 补环失败：无法提取环数据', 'error');
+                return;
+            }
+            ring.manual = true;
+            // 与现有环合并后按半径重新排序编号 (编号可再人工修改)
+            const merged = mergeAndNumberRings([...ringList.value, ring]);
+            imageManager.saveCurrentResultToCache(merged, center);
+            nextTick(() => drawDetectionResults(resultCanvasRef, imageManager));
+            showStatus(`✅ 已手动补环 (半径 ${radius.toFixed(1)}px)，编号已按半径重排，可手动修改`, 'success');
+        }
+
+        // Canvas交互包装函数 (含点击补环)
+        function initCanvasInteractionWrapper() {
+            initCanvasInteraction(resultImageRef, resultCanvasRef, imageManager, hoveredRingRef);
+            const img = resultImageRef.value;
+            if (img) {
+                img.addEventListener('click', completeRingAtClick);
+            }
+        }
+
+        // 从缓存恢复显示 (已识别过的图直接进入人工核对阶段)
         function restoreFromCache(resultData) {
             drawDetectionResults(resultCanvasRef, imageManager);
+            if (resultData?.detectedRings?.length > 0) {
+                centerPhase.value = 'done';
+                detectedCenter.value = resultData.center ? { ...resultData.center } : null;
+            }
             nextTick(() => initCanvasInteractionWrapper());
         }
 
@@ -613,8 +870,9 @@ export default {
 
             initOpenCV();
             initDragDrop(loadMultipleFiles, () => activeTab.value === 'rings');
-            // 键盘方向键微调标定标记
+            // 键盘方向键微调标定标记与圆心微调
             document.addEventListener('keydown', onCalibKeydown);
+            document.addEventListener('keydown', onCenterKeydown);
             // 恢复标定图片缓存
             loadCalibFromSession();
             nextTick(() => {
@@ -649,6 +907,21 @@ export default {
             averageRadius,
             calculationResults,
             hoveredRing: hoveredRingRef,
+
+            // 两步确认流程 + 环人工核对
+            centerPhase,
+            detectedCenter,
+            centerCrossArm,
+            confirmCenterAndDetectRings,
+            redetectCenter,
+            ringList,
+            manualRingCount,
+            onToggleRingEnabled,
+            onRingNumberChange,
+            renumberOnRemove,
+            onRenumberModeChange,
+            diffStep,
+            onDiffStepChange,
 
             // 像素标定
             calibImageA, calibImageB,
