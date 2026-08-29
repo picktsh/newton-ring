@@ -6,6 +6,10 @@ import { detectNewtonRingCenter, detectRingsWithCenter, mergeAndNumberRings, ext
 import { initCanvasInteraction, onTableRowHover, onTableRowLeave, initDragDrop, initCenterAdjustInteraction } from './interaction-handler.js';
 import { calculateDiameterData, calculateRadiusData, calculateAverageRadius, generateCalculationResults } from './data-calculator.js';
 import { drawDetectionResults, clearCanvas, drawCenterOverlay } from './canvas-drawer.js';
+import {
+    refineTranslationNear, refineTranslationByRings, verifyOverlayOffset, loadImageEl,
+    estimateTranslationByRingCenters, estimateTranslationByTemplate, estimateTranslationORB
+} from './image-registrator.js';
 
 const { ref, reactive, computed, onMounted, nextTick, watch } = Vue;
 
@@ -38,12 +42,7 @@ export default {
                     distanceManual: calibDistanceManual.value
                 };
                 sessionStorage.setItem(CALIB_KEY, JSON.stringify(data));
-                const points = {
-                    pointA: calibPointA.value,
-                    pointB: calibPointB.value,
-                    activeSlot: calibActiveSlot.value
-                };
-                sessionStorage.setItem(CALIB_POINT_KEY, JSON.stringify(points));
+                sessionStorage.setItem(CALIB_POINT_KEY, JSON.stringify(calibPointPairs.value));
             } catch (e) { console.warn('标定缓存保存失败:', e); }
         }
 
@@ -61,25 +60,27 @@ export default {
                 const rawPoints = sessionStorage.getItem(CALIB_POINT_KEY);
                 if (rawPoints) {
                     const pts = JSON.parse(rawPoints);
-                    calibPointA.value = pts.pointA || null;
-                    calibPointB.value = pts.pointB || null;
-                    calibActiveSlot.value = pts.activeSlot || 'A';
+                    // 兼容旧单点/多组格式；单组模式只保留最后一组 (旧多组缓存取最近一次取点)
+                    calibPointPairs.value = (Array.isArray(pts)
+                        ? pts
+                        : (pts?.pointA && pts?.pointB ? [{ a: pts.pointA, b: pts.pointB }] : [])).slice(-1);
                 }
             } catch (e) { console.warn('标定缓存加载失败:', e); }
         }
 
         const calibImageA = ref(null);  // { src, name, width, height }
         const calibImageB = ref(null);
-        const calibPointA = ref(null);  // { x, y } 像素坐标
-        const calibPointB = ref(null);
-        const calibActiveSlot = ref('A');  // 当前键盘微调的目标图片
+        // 特征点对 (单组模式): { a: {x,y}, b: {x,y} }，来自叠加画面取点 (一点击同时得到两图坐标)，每次取点替换上一组，表格只保留一行
+        const calibPointPairs = ref([]);
         const calibScaleA = ref(null);       // 图A对应鼓轮刻度 (mm)
         const calibScaleB = ref(null);       // 图B对应鼓轮刻度 (mm)
         const calibDistanceManual = ref(null); // 手动输入的实际距离 (mm)，优先于自动差值
         const calibFileInputA = ref(null);
         const calibFileInputB = ref(null);
-        const calibCanvasA = ref(null);
-        const calibCanvasB = ref(null);
+        // ===== 圆形截取: 在图A上框选圆形区域，同坐标同步应用到图B，确认后替换两图 (不自动重合) =====
+        const calibCroppedOriginals = ref(null); // { A, B } 截取前原图备份 (非空=当前已截取，可一键恢复)
+        const cropBusy = ref(false);             // 截取确认进行中
+        const cropMsg = ref('');                 // 截取结果提示
 
         // 自动差值 (由刻度差计算)
         const calibAutoDistance = computed(() => {
@@ -99,9 +100,109 @@ export default {
             }
         });
 
-        // 监听标定数据变化，自动缓存
-        watch([calibImageA, calibImageB, calibPointA, calibPointB, calibScaleA, calibScaleB, calibDistanceManual], () => {
+        // 监听标定数据变化，自动缓存 (点组用深监听，增删/微调均触发)
+        watch([calibImageA, calibImageB, calibPointPairs, calibScaleA, calibScaleB, calibDistanceManual], () => {
             saveCalibToSession();
+        }, { deep: true });
+
+        // ===== 叠加对齐 (粗对齐 + 精细对齐) =====
+        // 图B绘制偏移 (px): 正值=向右/向下移动，图B像素 b 显示在 b + (dx, dy) 处
+        const overlayDx = ref(0);
+        const overlayDy = ref(0);
+        const overlayFineDone = ref(false);   // 精细对齐完成 (仅此后允许在叠加画面上点击取点)
+        const overlayFineBusy = ref(false);
+        const overlayFineMsg = ref('');       // 精细对齐状态/结果直接显示在叠加卡片内 (标定页无日志面板)
+        const overlayScore = ref(null);        // 实时重合度残差 (重叠区 |A−B| 均值, 越小越准)；null=未计算/不可用
+        const overlayScoreBusy = ref(false);   // 残差计算进行中 (不阻塞滑块拖动，异步完成后更新)
+        const overlayCheckBusy = ref(false);   // 一键检查对齐进行中
+        const overlayMatchBusy = ref(false);   // 一键重叠 (手动触发的自动配准) 进行中
+        const overlayAutoPickBusy = ref(false); // 自动取点 (环系圆心拟合) 进行中
+        const overlayKeyFocus = ref(false);   // 方向键作用于叠加偏移 (否则作用于特征点微调)
+        let overlayPointsFromOverlay = false; // 当前特征点是否来自叠加取点 (偏移变化时随之作废)
+        const overlayStageRef = ref(null);
+        const overlayBaseImgRef = ref(null);
+        const overlayBImgRef = ref(null);
+        const overlayCanvasRef = ref(null);
+        const overlayDiffCanvasRef = ref(null);
+        const overlayScale = ref(0);          // 显示宽度 / 原始像素宽度 (随容器宽度变化)
+        const overlayBlendMode = ref('overlay'); // 'overlay' 半透明叠加 | 'difference' 差值模式 (对齐处画面最暗)
+        let overlayFitCenters = null;         // 环拟合成功时的两图环系圆心 (供取点半径复核与中心标记绘制)
+        let autoPickCache = null;             // 自动取点拟合缓存 { keyA, keyB, centers }: 环系圆心只依赖图片本身，同一对图重复点按钮秒回不重算 (图片更换时失效)
+        let overlayCheckCenters = null;       // 检查对齐得到的两图环系圆心 (随心A原位/心B随偏移移动，拖动滑块可见两标记靠近)
+        // 两图均已上传且尺寸一致才允许叠加对齐 (同机位拍摄前提)
+        const overlayReady = computed(() => {
+            return !!(calibImageA.value && calibImageB.value &&
+                calibImageA.value.width === calibImageB.value.width &&
+                calibImageA.value.height === calibImageB.value.height);
+        });
+        const overlaySizeMismatch = computed(() => !!(calibImageA.value && calibImageB.value && !overlayReady.value));
+        const overlayMaxX = computed(() => overlayReady.value ? Math.round(calibImageA.value.width / 2) : 0);
+        const overlayMaxY = computed(() => overlayReady.value ? Math.round(calibImageA.value.height / 2) : 0);
+        const overlayImgBStyle = computed(() => ({
+            position: 'absolute',
+            left: (overlayDx.value * overlayScale.value) + 'px',
+            top: (overlayDy.value * overlayScale.value) + 'px',
+            width: '100%',
+            opacity: 0.5,
+            // 灰度叠加模式: CSS 滤镜纯显示层去色 (不改变像素数据)，排除色彩干扰看重影更清楚；图A底图同步去色 (见模板中 overlayBaseImgRef 的 filter 绑定)
+            filter: overlayBlendMode.value === 'gray' ? 'grayscale(1)' : 'none',
+            pointerEvents: 'none'
+        }));
+        // 显示模式按钮组下方的一行提示 (按当前模式给出判读方法)
+        const overlayModeHint = computed(() => ({
+            overlay: '图B以 50% 透明度彩色叠加，重影消失即对齐',
+            gray: '两图去色后叠加，排除色彩干扰，重影消失即对齐',
+            difference: '越亮=错位越大，把环调到画面最暗即对齐'
+        }[overlayBlendMode.value] || ''));
+        // 精细对齐状态条样式 (按消息前缀着色: ✅成功 ⚠️不可靠 ❌失败 其它进行中)
+        const overlayFineMsgStyle = computed(() => {
+            const msg = overlayFineMsg.value;
+            const ok = msg.startsWith('✅'), warn = msg.startsWith('⚠️'), err = msg.startsWith('❌');
+            return {
+                marginTop: '10px', padding: '8px 12px', borderRadius: '6px', fontSize: '13px', fontWeight: 'bold',
+                background: ok ? '#eafaf1' : warn ? '#fff3cd' : err ? '#fdecea' : '#eef2ff',
+                color: ok ? '#27ae60' : warn ? '#856404' : err ? '#c0392b' : '#667eea'
+            };
+        });
+        // 亚像素偏移读数 (精细对齐保留抛物线/拟合的浮点结果，整数时不显示小数)
+        const overlayDxText = computed(() => Number.isInteger(overlayDx.value) ? String(overlayDx.value) : overlayDx.value.toFixed(1));
+        const overlayDyText = computed(() => Number.isInteger(overlayDy.value) ? String(overlayDy.value) : overlayDy.value.toFixed(1));
+        // 叠加画面重绘标记 (取点后显示各组特征点在叠加画面上的位置)
+        watch([calibPointPairs, overlayDx, overlayDy, overlayScale], () => {
+            if (overlayReady.value) nextTick(drawOverlayCanvas);
+        }, { deep: true });
+        // 差值模式/偏移变化: 差值模式下重绘差值画面；任何显示模式下节流重算实时重合度残差 (拖动滑块实时可见)
+        watch([overlayBlendMode, overlayDx, overlayDy, overlayScale], () => {
+            if (!overlayReady.value) return;
+            if (overlayBlendMode.value === 'difference') nextTick(drawOverlayDifference);
+            requestOverlayScoreUpdate();
+        });
+        // 图片更换/删除时重置叠加对齐状态 (偏移/精细对齐结果/叠加取点标志/检查标记/残差均失效)，
+        // 同时清空圆形截取状态与截取前原图备份 (新图需重新框选)；
+        // cropKeepOriginals=true 时表示本次图片替换来自截取确认，需保留原图备份 (监听器异步触发，晚于备份写入)
+        let cropKeepOriginals = false;
+        watch([calibImageA, calibImageB], () => {
+            if (cropKeepOriginals) {
+                cropKeepOriginals = false;
+            } else {
+                calibCroppedOriginals.value = null;
+            }
+            cropCenter.value = null;
+            cropRadius.value = 0;
+            cropBusy.value = false;
+            overlayDx.value = 0;
+            overlayDy.value = 0;
+            overlayFineDone.value = false;
+            overlayFineMsg.value = '';
+            overlayKeyFocus.value = false;
+            overlayPointsFromOverlay = false;
+            calibPointPairs.value = []; // 图片更换后旧特征点坐标失效
+            overlayFitCenters = null;
+            overlayCheckCenters = null;
+            autoPickCache = null;
+            invalidateOverlayScoreCache();
+            nextTick(updateOverlayScale);
+            requestOverlayScoreUpdate();
         });
         const initState = {
             // 获取滤镜参数初始值
@@ -212,21 +313,29 @@ export default {
             if (container) container.scrollTop = container.scrollHeight;
         }
 
-        // ===== 像素标定计算 =====
-        const calibDeltaX = computed(() => {
-            if (!calibPointA.value || !calibPointB.value) return 0;
-            return Math.abs(calibPointA.value.x - calibPointB.value.x);
+        // ===== 像素标定计算 (多组特征点) =====
+        // 表格行数据: 序号、两图坐标、ΔX/ΔY、像素距离、标定值 (有物理距离时)；单组模式下最多一行
+        const calibPairRows = computed(() => calibPointPairs.value.map((p, i) => {
+            const dx = Math.abs(p.a.x - p.b.x), dy = Math.abs(p.a.y - p.b.y);
+            const dist = Math.hypot(dx, dy);
+            return {
+                id: i,
+                ax: p.a.x, ay: p.a.y,
+                bx: p.b.x, by: p.b.y,
+                dx, dy, dist,
+                value: calibPhysicalDistance.value > 0 && dist > 0 ? calibPhysicalDistance.value / dist : 0
+            };
+        }));
+        // 像素距离 (单组模式即该组距离；保留平均值口径便于后续扩展)
+        const calibAvgDistance = computed(() => {
+            const rows = calibPairRows.value;
+            if (!rows.length) return 0;
+            return rows.reduce((sum, r) => sum + r.dist, 0) / rows.length;
         });
-        const calibDeltaY = computed(() => {
-            if (!calibPointA.value || !calibPointB.value) return 0;
-            return Math.abs(calibPointA.value.y - calibPointB.value.y);
-        });
-        const calibPixelDistance = computed(() => {
-            return Math.sqrt(calibDeltaX.value ** 2 + calibDeltaY.value ** 2);
-        });
+        // 最终标定值 = 物理距离 ÷ 像素距离
         const calibValue = computed(() => {
-            if (calibPixelDistance.value <= 0 || calibPhysicalDistance.value <= 0) return 0;
-            return calibPhysicalDistance.value / calibPixelDistance.value;
+            if (calibAvgDistance.value <= 0 || calibPhysicalDistance.value <= 0) return 0;
+            return calibPhysicalDistance.value / calibAvgDistance.value;
         });
 
         // 标定图片上传处理
@@ -241,12 +350,11 @@ export default {
                     const data = { src: e.target.result, name: file.name, width: img.naturalWidth, height: img.naturalHeight };
                     if (slot === 'A') {
                         calibImageA.value = data;
-                        calibPointA.value = null;
                     } else {
                         calibImageB.value = data;
-                        calibPointB.value = null;
                     }
-                    nextTick(() => drawCalibCanvas(slot));
+                    calibPointPairs.value = []; // 新图与旧特征点不对应，清空点组 (取点标记在叠加画面)
+                    calibCroppedOriginals.value = null; // 新上传的图视为原图，清空截取备份与截取状态 (由图片监听器统一重置)
                 };
                 img.src = e.target.result;
             };
@@ -255,134 +363,674 @@ export default {
         function handleCalibUploadA(e) { handleCalibUpload(e, 'A'); }
         function handleCalibUploadB(e) { handleCalibUpload(e, 'B'); }
 
-        // 点击选点
-        function onCalibClick(slot, event) {
-            const container = event.currentTarget;
-            const img = container.querySelector('img');
-            if (!img) return;
-            calibActiveSlot.value = slot;  // 点击时自动设为当前微调目标
-            const rect = container.getBoundingClientRect();
-            const clickX = event.clientX - rect.left;
-            const clickY = event.clientY - rect.top;
-            // 将显示坐标转换为原始像素坐标
-            const scaleX = (slot === 'A' ? calibImageA.value.width : calibImageB.value.width) / img.clientWidth;
-            const scaleY = (slot === 'A' ? calibImageA.value.height : calibImageB.value.height) / img.clientHeight;
-            const px = Math.round(clickX * scaleX);
-            const py = Math.round(clickY * scaleY);
-            if (slot === 'A') {
-                calibPointA.value = { x: px, y: py };
-            } else {
-                calibPointB.value = { x: px, y: py };
-            }
-            nextTick(() => drawCalibCanvas(slot));
-        }
-        function onCalibClickA(e) { onCalibClick('A', e); }
-        function onCalibClickB(e) { onCalibClick('B', e); }
-
-        // 键盘方向键微调标定标记 (仅标定页生效，避免与圆心微调冲突)
+        // 键盘方向键 (仅标定页生效): 叠加模式下 (最近操作过叠加区) 微调图B叠加偏移；
+        // 多组点无单点微调模式，其余情况方向键忽略
         function onCalibKeydown(e) {
             if (activeTab.value !== 'calibration') return;
-            const slot = calibActiveSlot.value;
-            const point = slot === 'A' ? calibPointA.value : calibPointB.value;
-            if (!point) return;
-            const step = e.shiftKey ? 5 : 1;
-            let dx = 0, dy = 0;
-            switch (e.key) {
-                case 'ArrowUp': dy = -step; break;
-                case 'ArrowDown': dy = step; break;
-                case 'ArrowLeft': dx = -step; break;
-                case 'ArrowRight': dx = step; break;
-                default: return;
+            const isArrowKey = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key);
+            if (isArrowKey && overlayReady.value && overlayKeyFocus.value) {
+                // 输入框聚焦时不拦截，避免干扰鼓轮刻度等输入 (微调可用滑块)
+                if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
+                e.preventDefault();
+                const step = e.shiftKey ? 5 : 1;
+                switch (e.key) {
+                    case 'ArrowUp': shiftOverlayBy(0, -step); break;
+                    case 'ArrowDown': shiftOverlayBy(0, step); break;
+                    case 'ArrowLeft': shiftOverlayBy(-step, 0); break;
+                    case 'ArrowRight': shiftOverlayBy(step, 0); break;
+                }
+                return;
             }
-            e.preventDefault();
-            const imgData = slot === 'A' ? calibImageA.value : calibImageB.value;
-            if (!imgData) return;
-            const newX = Math.max(0, Math.min(imgData.width - 1, point.x + dx));
-            const newY = Math.max(0, Math.min(imgData.height - 1, point.y + dy));
-            if (slot === 'A') {
-                calibPointA.value = { x: newX, y: newY };
-            } else {
-                calibPointB.value = { x: newX, y: newY };
-            }
-            nextTick(() => drawCalibCanvas(slot));
         }
 
-        // 绘制标定画布 (精细十字标记)
-        function drawCalibCanvas(slot) {
-            const canvas = slot === 'A' ? calibCanvasA.value : calibCanvasB.value;
-            const imgEl = canvas?.parentElement?.querySelector('img');
-            if (!canvas || !imgEl) return;
-            canvas.width = imgEl.clientWidth;
-            canvas.height = imgEl.clientHeight;
+        // ===== 叠加对齐操作 =====
+        // 显示比例更新 (图A加载完成/窗口宽度变化时调用)
+        function updateOverlayScale() {
+            const img = overlayBaseImgRef.value;
+            if (!img || !calibImageA.value || !img.clientWidth) return;
+            overlayScale.value = img.clientWidth / calibImageA.value.width;
+        }
+
+        // 叠加图片加载完成: 更新显示比例，差值模式下重绘差值画面 (图B首次解码完成时触发)
+        function onOverlayImgLoad() {
+            updateOverlayScale();
+            if (overlayBlendMode.value === 'difference') nextTick(drawOverlayDifference);
+        }
+
+        // 差值模式绘制: 显示 |A−B|×4，对齐处画面最暗、错位处呈亮环 (比看重影更客观的对齐判据)
+        function drawOverlayDifference() {
+            const canvas = overlayDiffCanvasRef.value;
+            const baseImg = overlayBaseImgRef.value;
+            const imgB = overlayBImgRef.value;
+            if (!canvas || !baseImg || !imgB || !calibImageA.value || !imgB.complete) return;
+            const w = baseImg.clientWidth, h = baseImg.clientHeight;
+            if (!w || !h) return;
+            const s = overlayScale.value || w / calibImageA.value.width;
+            canvas.width = w; canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            ctx.globalCompositeOperation = 'source-over';
+            ctx.drawImage(baseImg, 0, 0, w, h);
+            ctx.globalCompositeOperation = 'difference';
+            ctx.drawImage(imgB, overlayDx.value * s, overlayDy.value * s, w, h);
+            // 自叠加放大 ×4 (|A−B| 非负, 'lighter' 等效加倍)，微弱残差更易辨认 (信号过强时画面泛白属正常)
+            ctx.globalCompositeOperation = 'lighter';
+            ctx.drawImage(canvas, 0, 0);
+            ctx.drawImage(canvas, 0, 0);
+            ctx.globalCompositeOperation = 'source-over';
+        }
+
+        // 偏移变化: 精细对齐结果作废；叠加取出的特征点也随之作废 (位置已不再对应)；
+        // 检查对齐的圆心标记保留 (心B随偏移移动，拖动滑块可直观看到两标记靠近/远离)
+        function invalidateOverlayAlignment() {
+            overlayFineDone.value = false;
+            overlayFitCenters = null;
+            if (overlayPointsFromOverlay) {
+                overlayPointsFromOverlay = false;
+                calibPointPairs.value = []; // 偏移已变，叠加取出的特征点坐标不再对应，全部作废重新取点
+            }
+        }
+
+        // ===== 实时重合度残差: 重叠区 |A−B| 均值，越小说明叠得越准 =====
+        // 全尺寸逐像素差值会让拖滑块卡顿，故两图先缩成小灰度图缓存 (长边≤0.48倍原图短边)，
+        // 偏移变化时短防抖后异步重算；重叠区过小时残差无意义显示 —。
+        let overlayScoreCache = null;      // { key, smallA, smallB, scale } 缩小灰度图缓存 (图片更换时释放重建)
+        let overlayScoreTimer = null;      // 防抖定时器 (拖动滑块时避免逐帧重算)
+        let overlayScoreComputing = false; // 计算进行中 (脏标志保证结束后补算最新偏移)
+        let overlayScoreDirty = false;
+
+        function invalidateOverlayScoreCache() {
+            if (overlayScoreCache) {
+                overlayScoreCache.smallA?.delete?.();
+                overlayScoreCache.smallB?.delete?.();
+                overlayScoreCache = null;
+            }
+            overlayScore.value = null;
+        }
+
+        function requestOverlayScoreUpdate() {
+            if (!overlayReady.value || !cvReady.value) return;
+            overlayScoreDirty = true;
+            if (overlayScoreTimer || overlayScoreComputing) return; // 防抖中/计算中: 脏标志保证后续补算
+            overlayScoreTimer = setTimeout(() => {
+                overlayScoreTimer = null;
+                runOverlayScoreCompute();
+            }, 120);
+        }
+
+        // 加载单图并缩成小灰度图 (两图同尺寸同比例，保证逐像素可对齐相减)
+        async function loadSmallGray(src, targetCols) {
+            const imgEl = await loadImageEl(src);
+            const mat = cv.imread(imgEl);
+            const gray = new cv.Mat();
+            try {
+                cv.cvtColor(mat, gray, cv.COLOR_RGBA2GRAY);
+                const scale = targetCols / mat.cols;
+                if (scale >= 1) return gray.clone();
+                const small = new cv.Mat();
+                cv.resize(gray, small, new cv.Size(), scale, scale, cv.INTER_AREA);
+                return small;
+            } finally {
+                mat.delete();
+                gray.delete();
+            }
+        }
+
+        function runOverlayScoreCompute() {
+            if (overlayScoreComputing) { overlayScoreDirty = true; return; }
+            if (!overlayReady.value || !cvReady.value) return;
+            overlayScoreComputing = true;
+            overlayScoreBusy.value = true;
+            (async () => {
+                try {
+                    const imgA = calibImageA.value, imgB = calibImageB.value;
+                    if (!imgA || !imgB) return;
+                    const key = imgA.src + '|' + imgB.src;
+                    if (!overlayScoreCache || overlayScoreCache.key !== key) {
+                        overlayScoreCache?.smallA?.delete?.();
+                        overlayScoreCache?.smallB?.delete?.();
+                        const targetCols = Math.max(200, Math.round(Math.min(imgA.width, imgA.height) * 0.48));
+                        const [smallA, smallB] = await Promise.all([loadSmallGray(imgA.src, targetCols), loadSmallGray(imgB.src, targetCols)]);
+                        overlayScoreCache = { key, smallA, smallB, scale: smallA.cols / imgA.width };
+                    }
+                    const { smallA, smallB, scale } = overlayScoreCache;
+                    if (smallA.cols !== smallB.cols || smallA.rows !== smallB.rows) { overlayScore.value = null; return; }
+                    const W = smallA.cols, H = smallA.rows;
+                    // 绘制偏移换算到小图坐标: 图B像素 b 显示在 b+(sx,sy) 处，重叠区 = 显示坐标下两图都有内容的矩形
+                    const sx = Math.round(overlayDx.value * scale), sy = Math.round(overlayDy.value * scale);
+                    const x0 = Math.max(0, sx), x1 = Math.min(W, W + sx);
+                    const y0 = Math.max(0, sy), y1 = Math.min(H, H + sy);
+                    if (x1 - x0 < 40 || y1 - y0 < 40) { overlayScore.value = null; return; }
+                    const dA = smallA.data, dB = smallB.data;
+                    let sum = 0, cnt = 0;
+                    for (let y = y0; y < y1; y += 2) {
+                        const rowA = y * W, rowB = (y - sy) * W;
+                        for (let x = x0; x < x1; x += 2) {
+                            sum += Math.abs(dA[rowA + x] - dB[rowB + x - sx]);
+                            cnt++;
+                        }
+                    }
+                    overlayScore.value = cnt ? sum / cnt : null;
+                } catch (err) {
+                    console.warn('重合度残差计算失败:', err);
+                    overlayScore.value = null;
+                } finally {
+                    overlayScoreComputing = false;
+                    overlayScoreBusy.value = false;
+                    if (overlayScoreDirty) { overlayScoreDirty = false; requestOverlayScoreUpdate(); }
+                }
+            })();
+        }
+
+        // 残差读数与分档 (仅相对比较有意义: 两图曝光差异会使基准不为 0，拖到最小即对齐)
+        const overlayScoreText = computed(() => overlayScore.value == null ? '—' : overlayScore.value.toFixed(1));
+        const overlayScoreLevel = computed(() => {
+            const s = overlayScore.value;
+            if (s == null) return 'na';
+            if (s <= 12) return 'good';
+            if (s <= 30) return 'mid';
+            return 'bad';
+        });
+        const overlayScoreStyle = computed(() => {
+            const map = {
+                good: { background: '#eafaf1', color: '#27ae60', border: '1px solid #a9dfbf' },
+                mid: { background: '#fff8e1', color: '#b7791f', border: '1px solid #f5d78e' },
+                bad: { background: '#fdecea', color: '#c0392b', border: '1px solid #f5b7b1' },
+                na: { background: '#f4f4f4', color: '#999', border: '1px solid #ddd' }
+            };
+            return { padding: '2px 10px', borderRadius: '10px', fontFamily: 'monospace', fontSize: '12px', fontWeight: 'bold', ...map[overlayScoreLevel.value] };
+        });
+        const overlayScoreHint = computed(() => ({
+            good: '已接近对齐，可点「检查对齐」复核',
+            mid: '还有偏差，继续往数值变小的方向微调',
+            bad: '偏差较大，先叠合中心暗斑再调环纹',
+            na: overlayScoreBusy.value ? '计算中…' : '重叠区过小或不可用'
+        }[overlayScoreLevel.value]));
+
+        // ===== 一键检查对齐: 两图独立拟合环系圆心，按当前偏移换算后求残差 (只读判定，不改变偏移) =====
+        // 结论分级: ≤2px 准确 | ≤36px 建议直接点精细对齐 | 更大给出方向建议继续手动粗对齐；
+        // 同时把两环系圆心画到叠加画面 (心B随偏移移动，拖动滑块可见两标记靠近/远离)
+        async function runOverlayCheck() {
+            if (!overlayReady.value || overlayCheckBusy.value || overlayFineBusy.value) return;
+            if (!cvReady.value) {
+                overlayFineMsg.value = '❌ OpenCV 尚未加载完成，请稍候再试';
+                return showStatus('❌ OpenCV 尚未加载完成，请稍候再试', 'error');
+            }
+            overlayCheckBusy.value = true;
+            overlayFineMsg.value = '🔍 正在检查对齐 (拟合两图环系圆心)…';
+            try {
+                const res = await verifyOverlayOffset(
+                    { src: calibImageA.value.src }, { src: calibImageB.value.src },
+                    overlayDx.value, overlayDy.value);
+                if (!res.ok) {
+                    overlayCheckCenters = null;
+                    overlayFineMsg.value = `❌ 无法检查对齐: ${res.message}`;
+                    showStatus(`❌ 检查对齐失败: ${res.message}`, 'error');
+                    return;
+                }
+                overlayCheckCenters = { centerA: res.centerA, centerB: res.centerB };
+                nextTick(drawOverlayCanvas);
+                const devText = res.dev.toFixed(1);
+                if (res.dev <= 2) {
+                    overlayFineMsg.value = `✅ 对齐准确: 环系圆心残差 ${devText}px (${res.detail})，可直接取点；追求亚像素精度可再点「精细对齐」`;
+                    showStatus(`✅ 检查对齐: 残差 ${devText}px，对齐准确`, 'success');
+                } else {
+                    const sugText = res.suggestion ? describeShiftDirection(res.suggestion.dx, res.suggestion.dy) : '';
+                    const near = res.dev <= 36;
+                    overlayFineMsg.value = `⚠️ 对齐不够: 环系圆心残差 ${devText}px (${res.detail})${sugText ? ` → 建议把圆环${sugText}` : ''}${near ? '；或直接点「精细对齐」自动微调' : '，偏差超出精细对齐范围，请先继续手动粗对齐'}`;
+                    showStatus(`⚠️ 检查对齐: 残差 ${devText}px${sugText ? `，建议${sugText}` : ''}`, 'error');
+                }
+            } catch (err) {
+                console.error('检查对齐错误:', err);
+                overlayFineMsg.value = `❌ 检查对齐失败: ${err.message}`;
+                showStatus(`❌ 检查对齐失败: ${err.message}`, 'error');
+            } finally {
+                overlayCheckBusy.value = false;
+            }
+        }
+
+        // ===== 圆形截取 (手动框选 + 两图同坐标同步截取，截取后不自动重合，由用户自行点一键重叠) =====
+        // 圆形截取区状态: 圆心/半径均以图A原始像素坐标表示，图B使用完全相同的值 (两图同尺寸前提)
+        const cropStageRef = ref(null);
+        const cropBaseImgRef = ref(null);
+        const cropCenter = ref(null);   // { x, y } 圆心 (原始像素)
+        const cropRadius = ref(0);      // 半径 (原始像素)
+        // 原图展示 (未经任何处理): 截取后优先取截取前备份，保证预览区始终保持上传时的原始图 (不随截取/处理变化)
+        const calibOriginalA = computed(() => calibCroppedOriginals.value?.A || calibImageA.value);
+        const calibOriginalB = computed(() => calibCroppedOriginals.value?.B || calibImageB.value);
+        // 两图就绪且尺寸一致才允许截取；截过一次后需先恢复原图 (同一裁剪区重复截取无意义)
+        const cropReady = computed(() => overlayReady.value && !calibCroppedOriginals.value);
+        const cropRadiusMax = computed(() => overlayReady.value ? Math.floor(Math.min(calibImageA.value.width, calibImageA.value.height) / 2) : 0);
+        const cropRadiusMin = 20;
+        // 首次进入截取状态 (或更换图片后): 圆心居中、半径取短边 30%
+        watch(cropReady, (ready) => {
+            if (!ready || !calibImageA.value) return;
+            if (!cropCenter.value) {
+                cropCenter.value = { x: Math.round(calibImageA.value.width / 2), y: Math.round(calibImageA.value.height / 2) };
+                cropRadius.value = Math.round(Math.min(calibImageA.value.width, calibImageA.value.height) * 0.3);
+            }
+        }, { immediate: true });
+        // 截取圆圈的覆盖层样式 (显示坐标 = 原始像素 × 显示比例，与图B自动同位置)
+        const cropCircleStyle = computed(() => {
+            if (!cropReady.value || !cropCenter.value || !overlayScale.value) return { display: 'none' };
+            const s = overlayScale.value;
+            return {
+                position: 'absolute',
+                left: (cropCenter.value.x - cropRadius.value) * s + 'px',
+                top: (cropCenter.value.y - cropRadius.value) * s + 'px',
+                width: cropRadius.value * 2 * s + 'px',
+                height: cropRadius.value * 2 * s + 'px',
+                borderRadius: '50%',
+                border: '2px solid #e74c3c',
+                background: 'rgba(102, 126, 234, 0.08)',
+                boxShadow: '0 0 0 9999px rgba(0, 0, 0, 0.35)', // 圈外区域压暗突出截取范围 (超出容器部分被裁剪隐藏)
+                cursor: 'move'
+            };
+        });
+        // 拖拽移动截取圆 (显示坐标 → 原始像素，限幅使圆完整落在图内)
+        function onCropMouseDown(e) {
+            if (!cropReady.value || !cropCenter.value || cropBusy.value) return;
+            e.preventDefault();
+            const imgEl = cropBaseImgRef.value;
+            const scale = calibImageA.value.width / imgEl.clientWidth;
+            const startX = e.clientX, startY = e.clientY;
+            const startC = { ...cropCenter.value };
+            const move = (ev) => {
+                const nx = Math.round(startC.x + (ev.clientX - startX) * scale);
+                const ny = Math.round(startC.y + (ev.clientY - startY) * scale);
+                const r = cropRadius.value, W = calibImageA.value.width, H = calibImageA.value.height;
+                cropCenter.value = {
+                    x: Math.max(r, Math.min(W - r, nx)),
+                    y: Math.max(r, Math.min(H - r, ny))
+                };
+            };
+            const up = () => {
+                window.removeEventListener('mousemove', move);
+                window.removeEventListener('mouseup', up);
+            };
+            window.addEventListener('mousemove', move);
+            window.addEventListener('mouseup', up);
+        }
+        // +/− 调整截取半径 (±10px/次，限幅在 20px ~ 短边一半)
+        function adjustCropRadius(delta) {
+            if (!cropReady.value) return;
+            const r = Math.max(cropRadiusMin, Math.min(cropRadiusMax.value, cropRadius.value + delta));
+            cropRadius.value = r;
+            if (!cropCenter.value) return;
+            // 半径变化后限幅圆心，保证圆完整落在图内 (优先移动圆心，其次收缩半径)
+            const W = calibImageA.value.width, H = calibImageA.value.height;
+            let cx = Math.max(r, Math.min(W - r, cropCenter.value.x));
+            let cy = Math.max(r, Math.min(H - r, cropCenter.value.y));
+            if (cx > W - r || cx < r || cy > H - r || cy < r) {
+                const r2 = Math.min(r, Math.round(Math.min(W, H) / 2));
+                cropRadius.value = r2;
+                cx = Math.max(r2, Math.min(W - r2, cx));
+                cy = Math.max(r2, Math.min(H - r2, cy));
+            }
+            cropCenter.value = { x: cx, y: cy };
+        }
+        function adjustCropRadiusPlus() { adjustCropRadius(10); }
+        function adjustCropRadiusMinus() { adjustCropRadius(-10); }
+        // 确认截取: 两图用完全相同的圆心/半径做圆形剪裁 (圆外透明) → 替换为截取图并备份原图；
+        // 不自动触发重合 (由用户在下方叠加对齐卡片自行点「一键重叠」或手动拖滑块)
+        // 后续叠加、取点、标定全部在截取图上完成，点「恢复原图」可回退 (取点标记随之清空)
+        async function confirmCrop() {
+            if (!cropReady.value || !cropCenter.value || cropBusy.value) return;
+            if (!cropRadius.value || cropRadius.value < cropRadiusMin) return;
+            cropBusy.value = true;
+            cropMsg.value = '✂️ 正在截取…';
+            try {
+                const { x: cx, y: cy } = cropCenter.value, r = cropRadius.value;
+                const x0 = Math.max(0, cx - r), y0 = Math.max(0, cy - r);
+                const size = Math.min(2 * r, calibImageA.value.width - x0, calibImageA.value.height - y0);
+                if (size < cropRadiusMin * 2) {
+                    cropMsg.value = '❌ 截取区域过小，请缩小半径或移动圆心到图内';
+                    return;
+                }
+                const imgA = await loadImageEl(calibImageA.value.src);
+                const imgB = await loadImageEl(calibImageB.value.src);
+                const cut = (img) => {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = size; canvas.height = size;
+                    const ctx = canvas.getContext('2d');
+                    // 圆形剪裁: 圆外保持透明，两图用完全相同的坐标参数保证截取位置一致 (圆心贴边时自动裁成弓形)
+                    ctx.beginPath();
+                    ctx.arc(cx - x0, cy - y0, r, 0, Math.PI * 2);
+                    ctx.clip();
+                    ctx.drawImage(img, x0, y0, size, size, 0, 0, size, size);
+                    return canvas.toDataURL('image/png');
+                };
+                const origA = { ...calibImageA.value }, origB = { ...calibImageB.value };
+                cropKeepOriginals = true; // 本次替换来自截取确认，图片监听器勿清空备份 (监听器异步触发，晚于此同步代码)
+                calibCroppedOriginals.value = { A: origA, B: origB }; // 先备份再替换
+                calibImageA.value = { src: cut(imgA), name: origA.name + ' (截取)', width: size, height: size };
+                calibImageB.value = { src: cut(imgB), name: origB.name + ' (截取)', width: size, height: size };
+                calibPointPairs.value = []; // 坐标基于原图，截取后作废 (在叠加画面重新取点)
+                cropCenter.value = null;
+                cropRadius.value = 0;
+                cropMsg.value = `✅ 截取完成 (${size}×${size}px)，可在下方点「一键重叠」对齐截取图`;
+                showStatus(`✅ 圆形截取完成 (${size}×${size}px)，未自动重合，需要时请点「一键重叠」`, 'success');
+            } catch (err) {
+                console.error('截取失败:', err);
+                cropMsg.value = `❌ 截取失败: ${err.message}`;
+                showStatus(`❌ 截取失败: ${err.message}`, 'error');
+            } finally {
+                cropBusy.value = false;
+            }
+        }
+        // 恢复原图: 放弃截取结果，回到上传的原始图片 (叠加状态由图片监听器自动重置)
+        function restoreOriginalCalibImages() {
+            if (!calibCroppedOriginals.value) return;
+            const originals = calibCroppedOriginals.value;
+            calibCroppedOriginals.value = null; // 先清备份，避免替换动作触发监听器前状态混乱 (监听器只重置截取框状态)
+            calibImageA.value = originals.A;
+            calibImageB.value = originals.B;
+            cropMsg.value = '';
+            showStatus('✅ 已恢复原图，可重新框选截取或直接叠加对齐', 'info');
+        }
+
+        // ===== 一键重叠: 手动点击后自动把两图重复的环纹区域叠合 (不在上传时自动执行) =====
+        // 三级级联全自动配准 (支持两三百像素级大偏移):
+        //   圆心拟合 (整圈采样免疫环纹自相似，对大偏移友好) → 局部模板匹配 → ORB+RANSAC (内含相位相关兜底)；
+        // 环纹自相似会让肉眼看到多个"似乎重叠"的位置，多模板/多环交叉验证的算法链路才是可信判据。
+        // 成功后绘制偏移 = −(B相对A平移)，随后自动接精细对齐取亚像素精度并解锁叠加取点；失败保持位置不变并给出原因。
+        async function runOverlayOneClickAlign() {
+            if (!overlayReady.value || overlayMatchBusy.value || overlayFineBusy.value || overlayCheckBusy.value) return;
+            if (!cvReady.value) {
+                overlayFineMsg.value = '❌ OpenCV 尚未加载完成，请稍候再试';
+                return showStatus('❌ OpenCV 尚未加载完成，请稍候再试', 'error');
+            }
+            overlayMatchBusy.value = true;
+            const srcA = calibImageA.value.src, srcB = calibImageB.value.src;
+            const stale = () => calibImageA.value?.src !== srcA || calibImageB.value?.src !== srcB;
+            overlayKeyFocus.value = true;
+            showStatus('🪄 正在重叠两图重复部分…', 'info');
+            try {
+                const argA = { src: srcA }, argB = { src: srcB };
+                const steps = [
+                    { name: '圆心拟合', fn: () => estimateTranslationByRingCenters(argA, argB) },
+                    { name: '模板匹配', fn: () => estimateTranslationByTemplate(argA, argB) },
+                    { name: 'ORB特征匹配', fn: () => estimateTranslationORB(argA, argB) }
+                ];
+                let res = null;
+                const failures = [];
+                for (const step of steps) {
+                    overlayFineMsg.value = `🪄 正在重叠 (${step.name})…`;
+                    res = await step.fn();
+                    if (stale()) return; // 配准期间图片被更换 → 丢弃过期结果 (新图需重新点击)
+                    if (res.ok) break;
+                    failures.push(`${step.name}: ${res.message}`);
+                }
+                if (!res?.ok) {
+                    overlayFineMsg.value = `❌ 一键重叠失败，请继续拖滑块手动粗对齐。(${failures.join('；')})`;
+                    showStatus('❌ 一键重叠失败，请手动拖滑块粗对齐', 'error');
+                    return;
+                }
+                // 口径约定: 配准返回 B点 = A点 + (dx, dy)，绘制偏移取相反数使重复部分重合 (图二偏左时图B自动右移补偿)
+                overlayDx.value = -res.dx;
+                overlayDy.value = -res.dy;
+                const moved = describeShiftDirection(-res.dx, -res.dy) || '无显著位移';
+                overlayFineMsg.value = `✅ 重叠成功 (${res.method}): 图B${moved}, Δx=${overlayDxText.value}, Δy=${overlayDyText.value}px，继续精细对齐…`;
+                showStatus(`✅ 一键重叠成功 (${res.method}): 图B${moved}${res.detail ? ' (' + res.detail + ')' : ''}`, 'success');
+                // 接续精细对齐取亚像素精度并解锁叠加取点 (该函数自管 busy/状态消息)
+                await runOverlayFineAlign();
+            } catch (err) {
+                console.error('一键重叠错误:', err);
+                overlayFineMsg.value = `❌ 一键重叠出错: ${err.message}`;
+                showStatus(`❌ 一键重叠出错: ${err.message}`, 'error');
+            } finally {
+                overlayMatchBusy.value = false;
+            }
+        }
+
+        // 方向键/程序化移动叠加偏移 (限幅在滑块范围内)
+        function shiftOverlayBy(dx, dy) {
+            if (!overlayReady.value) return;
+            overlayDx.value = Math.max(-overlayMaxX.value, Math.min(overlayMaxX.value, overlayDx.value + dx));
+            overlayDy.value = Math.max(-overlayMaxY.value, Math.min(overlayMaxY.value, overlayDy.value + dy));
+            overlayFineMsg.value = '';
+            invalidateOverlayAlignment();
+        }
+
+        // 滑块拖动回调: 键盘焦点切换到叠加模式，精细对齐结果作废 (偏移已变，旧状态信息不再有效)
+        function onOverlayOffsetInput() {
+            overlayKeyFocus.value = true;
+            overlayFineMsg.value = '';
+            invalidateOverlayAlignment();
+        }
+
+        // 一键复位: 偏移归零重新粗对齐
+        function resetOverlayShift() {
+            overlayDx.value = 0;
+            overlayDy.value = 0;
+            overlayKeyFocus.value = true;
+            overlayFineMsg.value = '';
+            invalidateOverlayAlignment();
+            showStatus('✅ 叠加偏移已复位为零', 'info');
+        }
+
+        // 偏移修正量 → 人话方向描述 (绘制偏移增量 +Δx=图B右移, +Δy=图B下移；分量过小忽略)
+        function describeShiftDirection(dx, dy) {
+            const parts = [];
+            const ax = Math.abs(dx), ay = Math.abs(dy);
+            if (ax >= 0.5) parts.push(`${dx > 0 ? '右' : '左'}移约 ${Math.round(ax)}px`);
+            if (ay >= 0.5) parts.push(`${dy > 0 ? '下' : '上'}移约 ${Math.round(ay)}px`);
+            return parts.join('、');
+        }
+
+        // 精细对齐: 首选多环圆心拟合 (整圈采样免疫环纹局部自相似歧义)，失败回退局部模板微调；
+        // 结果不可靠时保持位置不变并在卡片内提示 (附方向性调整建议)；成功时保留亚像素浮点偏移 (不取整，贯通到取点换算)
+        async function runOverlayFineAlign() {
+            if (!overlayReady.value || overlayFineBusy.value) return;
+            if (!cvReady.value) {
+                overlayFineMsg.value = '❌ OpenCV 尚未加载完成，请稍候再试';
+                return showStatus('❌ OpenCV 尚未加载完成，请稍候再试', 'error');
+            }
+            overlayFineBusy.value = true;
+            overlayFineMsg.value = '🔬 正在精细对齐 (拟合环系圆心)…';
+            showStatus('🔬 正在精细对齐…', 'info');
+            try {
+                const args = [{ src: calibImageA.value.src }, { src: calibImageB.value.src }, overlayDx.value, overlayDy.value];
+                const oldDx = overlayDx.value, oldDy = overlayDy.value;
+                const ring = await refineTranslationByRings(...args);
+                let res = ring;
+                if (!ring.ok) {
+                    overlayFineMsg.value = '🔬 环拟合不可用，改用局部模板微调…';
+                    res = await refineTranslationNear(...args);
+                }
+                const method = res.method || '局部模板微调';
+                if (res.ok) {
+                    overlayDx.value = res.dx;   // 浮点亚像素偏移 (滑块仍可按 1px 手动覆盖)
+                    overlayDy.value = res.dy;
+                    overlayFitCenters = (res.centerA && res.centerB) ? { centerA: res.centerA, centerB: res.centerB } : null;
+                    overlayFineDone.value = true;
+                    overlayKeyFocus.value = true;
+                    const moved = describeShiftDirection(res.dx - oldDx, res.dy - oldDy);
+                    const movedText = moved ? `，本次${moved}` : '';
+                    overlayFineMsg.value = `✅ 精细对齐完成 (${method}): 偏移 Δx=${overlayDxText.value}px, Δy=${overlayDyText.value}px${movedText} (${res.detail})，可点击叠加画面取点`;
+                    showStatus(`✅ 精细对齐完成 (${method}): Δx=${overlayDxText.value}, Δy=${overlayDyText.value}${movedText} (${res.detail})`, 'success');
+                } else {
+                    const reasons = ring.ok ? res.message : `环拟合: ${ring.message}；模板微调: ${res.message}`;
+                    // 方向性调整建议: 环拟合目标最可信 (拟合圆心反推)，其次模板修正方向；无方向信息时提示用差值模式粗对齐
+                    const sug = (!ring.ok && ring.suggestion) ? ring.suggestion : res.suggestion;
+                    const sugText = sug ? describeShiftDirection(sug.dx, sug.dy) : '';
+                    overlayFineMsg.value = sugText
+                        ? `⚠️ 结果不可靠，位置保持不变: ${reasons}。→ 建议: 把圆环${sugText} (滑块/方向键粗对齐) 后再点精细对齐`
+                        : `⚠️ 结果不可靠，位置保持不变: ${reasons}。→ 建议: 切换差值模式，把环调到画面最暗后再点精细对齐`;
+                    showStatus(`⚠️ 精细对齐结果不可靠，已保持当前位置不变${sugText ? `，建议${sugText}` : ''}: ${reasons}`, 'error');
+                }
+            } catch (err) {
+                console.error('精细对齐错误:', err);
+                overlayFineMsg.value = `❌ 精细对齐失败: ${err.message}`;
+                showStatus(`❌ 精细对齐失败: ${err.message}`, 'error');
+            } finally {
+                overlayFineBusy.value = false;
+            }
+        }
+
+        // ===== 自动取点 (测量移动像素距离): 用环系圆心作为特征点对直接填充表格 (无需手动点击画面，也不依赖精细对齐) =====
+        // 环系圆心 (环纹接触点) 是两图中对应的同一物理点。优先级: 精细对齐现成结果 > 缓存 (同图秒回) > 现场拟合 (缩图加速)。
+        // 拟合前让出一帧给浏览器渲染 (否则重计算阻塞主线程，按钮状态来不及刷新看起来像无响应)；拟合失败时给出原因。
+        async function autoPickCalibPoint() {
+            if (!overlayReady.value || overlayAutoPickBusy.value) return;
+            if (!cvReady.value) {
+                return showStatus('❌ OpenCV 尚未加载完成，请稍候再试', 'error');
+            }
+            overlayAutoPickBusy.value = true;
+            showStatus('🎯 自动取点: 正在拟合两图环系圆心…', 'info');
+            try {
+                let centers = overlayFitCenters; // 精细对齐环拟合路径的现成结果优先 (全尺寸亚像素精度，零耗时)
+                if (!centers) {
+                    const keyA = calibImageA.value.src, keyB = calibImageB.value.src;
+                    if (autoPickCache && autoPickCache.keyA === keyA && autoPickCache.keyB === keyB) {
+                        centers = autoPickCache.centers; // 同一对图已拟合过: 直接用缓存，不重算 (秒回)
+                    } else {
+                        // 让出一帧，先把「取点中…」状态渲染上屏再进入重计算 (拟合耗时 1~2 秒，避免看起来卡死无响应)
+                        await new Promise(r => setTimeout(r, 30));
+                        const res = await verifyOverlayOffset(
+                            { src: keyA }, { src: keyB },
+                            overlayDx.value, overlayDy.value);
+                        if (!res.ok) {
+                            showStatus(`❌ 自动取点失败: ${res.message}`, 'error');
+                            return;
+                        }
+                        centers = { centerA: res.centerA, centerB: res.centerB };
+                        autoPickCache = { keyA, keyB, centers }; // 图片不变时重复点按钮不再重算 (图片更换时由监听器置空)
+                    }
+                    overlayCheckCenters = centers; // 在叠加画面画出检A/检B圆心标记供核对 (偏移变化时随之作废)
+                }
+                const r3 = v => Math.round(v * 1000) / 1000; // 与手动取点同口径，坐标保留 3 位小数
+                const a = { x: r3(centers.centerA.x), y: r3(centers.centerA.y) };
+                const b = { x: r3(centers.centerB.x), y: r3(centers.centerB.y) };
+                calibPointPairs.value = [{ a, b }]; // 单组模式: 替换当前特征点，表格自动重算该行全部数据 (移动像素距离 = ΔX/ΔY/像素距离)
+                overlayPointsFromOverlay = true;    // 与叠加取点同性质: 偏移变化时随之作废 (由 invalidateOverlayAlignment 清理)
+                showStatus(`✅ 自动取点完成: 图A (${a.x}, ${a.y}) | 图B (${b.x}, ${b.y})`, 'success');
+                nextTick(drawOverlayCanvas);
+            } catch (err) {
+                console.error('自动取点错误:', err);
+                showStatus(`❌ 自动取点失败: ${err.message}`, 'error');
+            } finally {
+                overlayAutoPickBusy.value = false;
+            }
+        }
+
+        // 叠加画面点击取点 (仅精细对齐完成后允许): 分别保存图A/图B各自的原始像素坐标。
+        // 同一物理特征: 图B坐标 = 图A坐标 − 绘制偏移 (叠加时图B像素 b 显示在 b + (dx, dy) 处)
+        function onOverlayClick(e) {
+            if (!overlayReady.value) return;
+            overlayKeyFocus.value = true;
+            if (!overlayFineDone.value) {
+                showStatus('⚠️ 请先完成【精细对齐】，再在叠加画面上取点', 'info');
+                return;
+            }
+            const baseImg = overlayBaseImgRef.value;
+            if (!baseImg || !calibImageA.value) return;
+            const rect = baseImg.getBoundingClientRect();
+            const scale = calibImageA.value.width / rect.width;
+            const px = Math.round((e.clientX - rect.left) * scale * 1000) / 1000;
+            const py = Math.round((e.clientY - rect.top) * scale * 1000) / 1000;
+            if (px < 0 || py < 0 || px >= calibImageA.value.width || py >= calibImageA.value.height) return;
+            // 亚像素偏移参与换算 (图B坐标 = 点击坐标 − 浮点绘制偏移)
+            const bx = Math.round((px - overlayDx.value) * 1000) / 1000;
+            const by = Math.round((py - overlayDy.value) * 1000) / 1000;
+            if (bx < 0 || by < 0 || bx >= calibImageB.value.width || by >= calibImageB.value.height) {
+                showStatus('⚠️ 该点击位置对应的图B特征点越出图像边界，请在两图重叠区域内点击', 'info');
+                return;
+            }
+            // 半径一致性复核 (环拟合圆心可用时): 同一环上点到环系圆心的距离两图应相等，差异过大提示可能未取在同序环上 (仅警告不阻止)
+            if (overlayFitCenters) {
+                const dA = Math.hypot(px - overlayFitCenters.centerA.x, py - overlayFitCenters.centerA.y);
+                const dB = Math.hypot(bx - overlayFitCenters.centerB.x, by - overlayFitCenters.centerB.y);
+                if (Math.abs(dA - dB) > 3) {
+                    showStatus(`⚠️ 半径复核: 该点到环系圆心距离两图相差 ${Math.abs(dA - dB).toFixed(1)}px，可能未取在同一环上，建议重新取点`, 'info');
+                }
+            }
+            // 单组模式: 每次取点替换上一组 (表格只显示一行)，坐标保留 3 位小数；表格与标定值响应式自动重算
+            calibPointPairs.value = [{ a: { x: px, y: py }, b: { x: bx, y: by } }];
+            overlayPointsFromOverlay = true;
+            showStatus(`✅ 叠加取点完成: 图A (${px}, ${py}) | 图B (${bx}, ${by})`, 'success');
+            nextTick(drawOverlayCanvas);
+        }
+
+        // 叠加画面标记层绘制: A点按图A坐标、B点按 图B坐标+偏移 换算到叠加画面显示坐标 (对齐良好时两点重合)
+        function drawOverlayCanvas() {
+            const canvas = overlayCanvasRef.value;
+            const baseImg = overlayBaseImgRef.value;
+            if (!canvas || !baseImg || !calibImageA.value) return;
+            canvas.width = baseImg.clientWidth;
+            canvas.height = baseImg.clientHeight;
             const ctx = canvas.getContext('2d');
             ctx.clearRect(0, 0, canvas.width, canvas.height);
-            const point = slot === 'A' ? calibPointA.value : calibPointB.value;
-            const imgData = slot === 'A' ? calibImageA.value : calibImageB.value;
-            if (!point || !imgData) return;
-            // 像素坐标 → 显示坐标
-            const displayX = point.x * imgEl.clientWidth / imgData.width;
-            const displayY = point.y * imgEl.clientHeight / imgData.height;
-            const color = slot === 'A' ? '#667eea' : '#764ba2';
-            // 画长十字线（贯穿整个图片，细线）
-            ctx.strokeStyle = color;
-            ctx.lineWidth = 1;
-            ctx.globalAlpha = 0.4;
-            ctx.beginPath();
-            ctx.moveTo(0, displayY);
-            ctx.lineTo(canvas.width, displayY);
-            ctx.moveTo(displayX, 0);
-            ctx.lineTo(displayX, canvas.height);
-            ctx.stroke();
-            ctx.globalAlpha = 1;
-            // 画中心精细十字（短而细）
-            ctx.lineWidth = 1;
-            ctx.strokeStyle = color;
-            const gap = 4;  // 中心留空
-            const arm = 18; // 臂长
-            ctx.beginPath();
-            ctx.moveTo(displayX - arm, displayY);
-            ctx.lineTo(displayX - gap, displayY);
-            ctx.moveTo(displayX + gap, displayY);
-            ctx.lineTo(displayX + arm, displayY);
-            ctx.moveTo(displayX, displayY - arm);
-            ctx.lineTo(displayX, displayY - gap);
-            ctx.moveTo(displayX, displayY + gap);
-            ctx.lineTo(displayX, displayY + arm);
-            ctx.stroke();
-            // 画小圆点
-            ctx.beginPath();
-            ctx.arc(displayX, displayY, 2, 0, Math.PI * 2);
-            ctx.fillStyle = color;
-            ctx.fill();
-            // 标注坐标
-            ctx.fillStyle = color;
-            ctx.font = '11px monospace';
-            ctx.fillText(`(${point.x}, ${point.y})`, displayX + 10, displayY - 8);
+            const s = overlayScale.value || baseImg.clientWidth / calibImageA.value.width;
+            // 圆心标记绘制: 心A原位、心B按当前偏移换算 (对齐良好时两中心重合；拖动滑块可见标记移动)
+            const cm = (x, y, color, label) => {
+                ctx.strokeStyle = color; ctx.lineWidth = 1;
+                ctx.beginPath(); ctx.arc(x, y, 5, 0, Math.PI * 2); ctx.stroke();
+                ctx.beginPath(); ctx.arc(x, y, 1.5, 0, Math.PI * 2); ctx.fillStyle = color; ctx.fill();
+                ctx.font = '10px monospace'; ctx.fillText(label, x + 7, y + 13);
+            };
+            // 精细对齐的环拟合圆心 (供取点参考)
+            if (overlayFitCenters) {
+                cm(overlayFitCenters.centerA.x * s, overlayFitCenters.centerA.y * s, '#e67e22', '心A');
+                cm((overlayFitCenters.centerB.x + overlayDx.value) * s, (overlayFitCenters.centerB.y + overlayDy.value) * s, '#16a085', '心B');
+            }
+            // 检查对齐的环系圆心 (红/蓝区分，手动偏移时心B随之移动，直观看到偏差收敛)
+            if (overlayCheckCenters) {
+                cm(overlayCheckCenters.centerA.x * s, overlayCheckCenters.centerA.y * s, '#c0392b', '检A');
+                cm((overlayCheckCenters.centerB.x + overlayDx.value) * s, (overlayCheckCenters.centerB.y + overlayDy.value) * s, '#2980b9', '检B');
+            }
+            // 多组特征点标记: 对齐良好时每组 A/B 点重合，按图A坐标画一个编号标记 (编号与下方表格序号对应)
+            const pairs = calibPointPairs.value;
+            if (!pairs.length) return;
+            pairs.forEach((p, i) => {
+                const x = p.a.x * s, y = p.a.y * s;
+                ctx.strokeStyle = '#e74c3c';
+                ctx.lineWidth = 1.5;
+                ctx.beginPath(); ctx.arc(x, y, 6, 0, Math.PI * 2); ctx.stroke();
+                ctx.beginPath(); ctx.arc(x, y, 1.5, 0, Math.PI * 2); ctx.fillStyle = '#e74c3c'; ctx.fill();
+                ctx.font = 'bold 10px monospace';
+                ctx.fillText(String(i + 1), x + 8, y - 6);
+            });
         }
 
-        // 删除单张标定图片
+        // 删除单张标定图片 (点组与截取备份随之失效)
         function removeCalibImage(slot) {
             if (slot === 'A') {
                 calibImageA.value = null;
-                calibPointA.value = null;
             } else {
                 calibImageB.value = null;
-                calibPointB.value = null;
             }
+            calibPointPairs.value = [];
+            calibCroppedOriginals.value = null;
             saveCalibToSession();
         }
 
-        // 重置标定
+        // 重置标定 (含清空点组与截取备份)
         function resetCalibration() {
             calibImageA.value = null;
             calibImageB.value = null;
-            calibPointA.value = null;
-            calibPointB.value = null;
+            calibPointPairs.value = [];
             calibScaleA.value = null;
             calibScaleB.value = null;
             calibDistanceManual.value = null;
+            calibCroppedOriginals.value = null;
             sessionStorage.removeItem(CALIB_KEY);
             sessionStorage.removeItem(CALIB_POINT_KEY);
+        }
+
+        // 删除特征点 (单组模式下即清除唯一一行，表格行与叠加画面标记同步移除)
+        function removeCalibPair(index) {
+            if (index < 0 || index >= calibPointPairs.value.length) return;
+            calibPointPairs.value.splice(index, 1);
+            nextTick(drawOverlayCanvas);
+        }
+
+        // 清空特征点 (需先确认，防误触)
+        function clearCalibPairs() {
+            if (!calibPointPairs.value.length) return;
+            if (!confirm('确定清空当前特征点吗？')) return;
+            calibPointPairs.value = [];
+            nextTick(drawOverlayCanvas);
+            showStatus('🗑️ 已清空特征点', 'info');
         }
 
         // 应用标定值到牛顿环识别
@@ -873,11 +1521,12 @@ export default {
             // 键盘方向键微调标定标记与圆心微调
             document.addEventListener('keydown', onCalibKeydown);
             document.addEventListener('keydown', onCenterKeydown);
-            // 恢复标定图片缓存
+            // 窗口宽度变化时更新叠加显示比例 (图A按容器宽度自适应缩放)
+            window.addEventListener('resize', updateOverlayScale);
+            // 恢复标定图片缓存后重绘叠加画面标记 (含缓存的多组特征点)
             loadCalibFromSession();
             nextTick(() => {
-                if (calibImageA.value) drawCalibCanvas('A');
-                if (calibImageB.value) drawCalibCanvas('B');
+                if (overlayReady.value) drawOverlayCanvas();
             });
         });
 
@@ -923,20 +1572,48 @@ export default {
             diffStep,
             onDiffStepChange,
 
-            // 像素标定
+            // 像素标定 (单组特征点: 表格一行 + 像素距离 3 位小数)
             calibImageA, calibImageB,
-            calibPointA, calibPointB,
+            calibPointPairs, calibPairRows, calibAvgDistance, calibValue,
             calibScaleA, calibScaleB,
             calibDistanceManual,
             calibAutoDistance, calibPhysicalDistance,
-            calibDeltaX, calibDeltaY, calibPixelDistance, calibValue,
             calibFileInputA, calibFileInputB,
-            calibCanvasA, calibCanvasB,
-            calibActiveSlot,
             handleCalibUploadA, handleCalibUploadB,
-            onCalibClickA, onCalibClickB,
+            removeCalibPair, clearCalibPairs,
             removeCalibImage,
             resetCalibration, applyCalibration,
+
+            // 圆形截取 (两图同坐标同步截取，截取后手动点一键重叠)
+            calibCroppedOriginals,
+            calibOriginalA, calibOriginalB,
+            cropStageRef, cropBaseImgRef, cropCircleStyle,
+            cropReady, cropBusy, cropMsg,
+            cropRadius, cropRadiusMin, cropRadiusMax,
+            adjustCropRadiusPlus, adjustCropRadiusMinus,
+            onCropMouseDown,
+            confirmCrop, restoreOriginalCalibImages,
+
+            // 叠加对齐 (粗对齐 + 精细对齐)
+            overlayDx, overlayDy,
+            overlayDxText, overlayDyText,
+            overlayBlendMode,
+            overlayModeHint,
+            overlayFineDone, overlayFineBusy, overlayCheckBusy, overlayMatchBusy, overlayAutoPickBusy, overlayFineMsg, overlayFineMsgStyle,
+            overlayScore, overlayScoreText, overlayScoreStyle, overlayScoreHint,
+            overlayReady, overlaySizeMismatch,
+            overlayMaxX, overlayMaxY,
+            overlayImgBStyle,
+            overlayStageRef, overlayBaseImgRef, overlayBImgRef, overlayCanvasRef, overlayDiffCanvasRef,
+            updateOverlayScale,
+            onOverlayImgLoad,
+            onOverlayOffsetInput,
+            resetOverlayShift,
+            runOverlayOneClickAlign,
+            runOverlayFineAlign,
+            runOverlayCheck,
+            autoPickCalibPoint,
+            onOverlayClick,
 
             handleFileUpload,
             processImage,

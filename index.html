@@ -111,6 +111,8 @@
         .calibration-metric label { font-size: 12px; color: #666; display: block; margin-bottom: 4px; }
         .calibration-metric .value { font-size: 18px; font-weight: bold; color: #333; }
         .calibration-hint { padding: 10px; background: #fff3cd; border-radius: 6px; font-size: 13px; color: #856404; margin-top: 10px; }
+        .overlay-stage { position: relative; border: 1px solid #ddd; border-radius: 4px; overflow: hidden; background: #111; }
+        .overlay-stage > img:first-child { display: block; width: 100%; height: auto; }
 
         /* Responsive */
         @media (max-width: 768px) { .grid-2 { grid-template-columns: 1fr; } .grid-auto { grid-template-columns: 1fr; } }
@@ -426,7 +428,9 @@
                 <div class="card" style="border-left: 4px solid #667eea;">
                     <h3 style="color: #333; margin-bottom: 8px;">📏 像素标定值测定</h3>
                     <p style="font-size: 13px; color: #666; line-height: 1.6;">
-                        通过转动测微鼓轮，先后拍摄两张显微镜视野图片。上传后分别在两张图上点击同一特征点，系统计算像素距离。
+                        通过转动测微鼓轮，先后拍摄两张显微镜视野图片。上传后先在图A上框选圆形截取区 (两图用完全相同的位置截取)，
+                        确认后替换为截取图 (不自动重合)，再点「一键重叠」对齐截取图；也可点「一键重叠」直接对齐全图 (或手动拖滑块)。
+                        再在叠加画面上点击同一特征点，系统计算像素距离 (保留 3 位小数)。
                         输入鼓轮实际移动的物理距离，即可算出标定值（mm/像素）。
                     </p>
                 </div>
@@ -434,14 +438,14 @@
                 <!-- 图片上传区 -->
                 <div class="card">
                     <div class="calibration-upload-row">
-                        <span style="font-weight: bold; color: #333;">图片A:</span>
+                        <span style="font-weight: bold; color: #333;">图片A (移动前):</span>
                         <button class="calibration-upload-btn" @click="calibFileInputA.click()">
                             {{ calibImageA ? '✅ ' + calibImageA.name : '📷 选择图片A' }}
                         </button>
                         <button v-if="calibImageA" class="calibration-upload-btn" style="background: #e74c3c; padding: 6px 10px; font-size: 12px;" @click="removeCalibImage('A')">
                             ✖ 删除
                         </button>
-                        <span style="font-weight: bold; color: #333;">图片B:</span>
+                        <span style="font-weight: bold; color: #333;">图片B (移动后):</span>
                         <button class="calibration-upload-btn" @click="calibFileInputB.click()">
                             {{ calibImageB ? '✅ ' + calibImageB.name : '📷 选择图片B' }}
                         </button>
@@ -451,110 +455,216 @@
                         <button v-if="calibImageA || calibImageB" class="calibration-upload-btn" style="background: linear-gradient(135deg, #e74c3c, #c0392b);" @click="resetCalibration">
                             🔄 全部重置
                         </button>
+                        <button v-if="calibCroppedOriginals" class="calibration-upload-btn" style="background: linear-gradient(135deg, #f39c12, #e67e22);" @click="restoreOriginalCalibImages">
+                            ↩ 恢复原图 (当前为截取图)
+                        </button>
                     </div>
                     <input type="file" ref="calibFileInputA" accept="image/*" @change="handleCalibUploadA" style="display: none;">
                     <input type="file" ref="calibFileInputB" accept="image/*" @change="handleCalibUploadB" style="display: none;">
+                </div>
+
+                <!-- 原图展示 (左) + 圆形截取 (右) 并排 -->
+                <div style="display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap;">
+                    <!-- 原图展示: 始终保持未经任何处理的样子 (截取后仍显示原图备份，不随截取/处理变化) -->
+                    <div class="card" v-if="calibImageA || calibImageB" style="flex: 0 0 250px; max-width: 250px;">
+                        <h3 style="color: #333; margin-bottom: 10px;">
+                            🖼️ 原图展示
+                            <span style="font-size: 12px; color: #999; margin-left: 10px;">未经任何处理，始终保持此状态</span>
+                        </h3>
+                        <div style="margin-bottom: 6px; font-size: 12px; color: #667eea; font-weight: bold;">图A (移动前)</div>
+                        <img v-if="calibOriginalA" :src="calibOriginalA.src" alt="图A 原图" style="display: block; width: 100%; height: auto; border: 1px solid #ddd; border-radius: 4px; margin-bottom: 6px;">
+                        <div v-else style="font-size: 12px; color: #bbb; margin-bottom: 6px;">尚未上传</div>
+                        <!-- 图A (移动前) 对应的读数显微镜刻度: 与图B刻度共同自动算出实际移动距离 -->
+                        <div style="display: flex; align-items: center; gap: 6px; margin-bottom: 12px;">
+                            <label style="font-size: 12px; color: #667eea; font-weight: bold; white-space: nowrap;">读数刻度 (mm):</label>
+                            <input type="number" v-model.number="calibScaleA" step="0.001" placeholder="读数" style="width: 100%; padding: 4px 6px; border: 1px solid #667eea; border-radius: 3px; font-size: 12px; text-align: right; box-sizing: border-box;">
+                        </div>
+                        <div style="margin-bottom: 6px; font-size: 12px; color: #764ba2; font-weight: bold;">图B (移动后)</div>
+                        <img v-if="calibOriginalB" :src="calibOriginalB.src" alt="图B 原图" style="display: block; width: 100%; height: auto; border: 1px solid #ddd; border-radius: 4px; margin-bottom: 6px;">
+                        <div v-else style="font-size: 12px; color: #bbb; margin-bottom: 6px;">尚未上传</div>
+                        <!-- 图B (移动后) 对应的读数显微镜刻度 -->
+                        <div style="display: flex; align-items: center; gap: 6px;">
+                            <label style="font-size: 12px; color: #764ba2; font-weight: bold; white-space: nowrap;">读数刻度 (mm):</label>
+                            <input type="number" v-model.number="calibScaleB" step="0.001" placeholder="读数" style="width: 100%; padding: 4px 6px; border: 1px solid #764ba2; border-radius: 3px; font-size: 12px; text-align: right; box-sizing: border-box;">
+                        </div>
+                    </div>
+
+                    <!-- 圆形截取: 在图A上框选，同坐标同步应用到图B，确认后替换两图 (不自动重合) -->
+                    <div class="card" v-if="cropReady" style="flex: 1 1 480px;">
+                    <h3 style="color: #333; margin-bottom: 10px;">
+                        ✂️ 圆形截取 (两图同位置)
+                        <span style="font-size: 12px; color: #999; margin-left: 10px;">在图A上拖拽红色圆圈选择截取范围，图B自动使用完全相同的圆心与半径；确认后替换为截取图 (不自动重合)</span>
+                    </h3>
+                    <div ref="cropStageRef" @mousedown="onCropMouseDown" style="position: relative; display: inline-block; max-width: 100%; overflow: hidden; cursor: move; user-select: none; line-height: 0;">
+                        <img ref="cropBaseImgRef" :src="calibImageA.src" @load="updateOverlayScale" alt="图A (截取基准)" style="display: block; max-width: 100%; height: auto;">
+                        <div :style="cropCircleStyle"></div>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 12px; margin-top: 12px; flex-wrap: wrap;">
+                        <button class="calibration-upload-btn" style="background: linear-gradient(135deg, #e67e22, #f39c12);" @click="adjustCropRadiusMinus">－ 缩小</button>
+                        <input type="range" :min="cropRadiusMin" :max="cropRadiusMax" step="1" v-model.number="cropRadius" style="width: 220px;">
+                        <button class="calibration-upload-btn" style="background: linear-gradient(135deg, #e67e22, #f39c12);" @click="adjustCropRadiusPlus">＋ 放大</button>
+                        <span style="font-size: 12px; color: #666; font-family: monospace;">半径 {{ cropRadius }} px</span>
+                        <button class="calibration-upload-btn" style="background: linear-gradient(135deg, #667eea, #764ba2);" :disabled="cropBusy || !cropReady" @click="confirmCrop">
+                            {{ cropBusy ? '⏳ 截取中…' : '✂️ 确认截取' }}
+                        </button>
+                    </div>
+                    <div v-if="cropMsg" style="margin-top: 8px; font-size: 13px; color: #667eea; font-weight: bold;">{{ cropMsg }}</div>
+                    <div class="calibration-hint">
+                        💡 拖动红色圆圈把截取范围对准要重叠的环纹区域，点 <b>－/＋</b> (或拖滑块) 调整半径。点击 <b>确认截取</b> 后，两图按完全相同的位置截成圆形图 (不会自动重合)，再到下方叠加对齐卡片点 <b>一键重叠</b> 或手动拖滑块对齐。
+                        截取后如需重选区域，点上方 <b>恢复原图</b>。截取图也可跳过本步，直接在下方叠加对齐卡片手动处理。
+                    </div>
+                </div>
+                </div>
+
+                <!-- 叠加对齐 (粗对齐 + 精细对齐) -->
+                <div class="card" v-if="calibImageA && calibImageB">
+                    <h3 style="color: #333; margin-bottom: 10px;">
+                        🔍 叠加对齐 (一键重叠 / 手动粗对齐 + 精细对齐)
+                        <span style="font-size: 12px; color: #999; margin-left: 10px;">当前操作对象: {{ calibCroppedOriginals ? '截取图' : '原始图' }}。图A固定，图B半透明叠加，点「一键重叠」自动对齐重复部分，或拖动滑块/方向键手动对齐</span>
+                    </h3>
+                    <div v-if="overlaySizeMismatch" class="calibration-hint" style="background: #fdecea; color: #c0392b;">
+                        ⚠️ 两张图片尺寸不一致，无法叠加对齐。请使用同一机位拍摄的两张图片。
+                    </div>
+                    <template v-else>
+                        <!-- 显示模式按钮组: 彩色叠加 / 灰度叠加 / 差值模式 (均为纯显示层变换，不改变图片像素) -->
+                        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap;">
+                            <span style="font-size: 12px; color: #666;">观察模式:</span>
+                            <button class="calibration-upload-btn" style="padding: 5px 12px; font-size: 12px;" :style="{ background: overlayBlendMode === 'overlay' ? 'linear-gradient(135deg, #667eea, #764ba2)' : '#c8ccd4' }" @click="overlayBlendMode = 'overlay'">🌈 彩色叠加</button>
+                            <button class="calibration-upload-btn" style="padding: 5px 12px; font-size: 12px;" :style="{ background: overlayBlendMode === 'gray' ? 'linear-gradient(135deg, #667eea, #764ba2)' : '#c8ccd4' }" @click="overlayBlendMode = 'gray'">⬜ 灰度叠加</button>
+                            <button class="calibration-upload-btn" style="padding: 5px 12px; font-size: 12px;" :style="{ background: overlayBlendMode === 'difference' ? 'linear-gradient(135deg, #667eea, #764ba2)' : '#c8ccd4' }" @click="overlayBlendMode = 'difference'">⬛ 差值模式</button>
+                            <span style="font-size: 11px; color: #999;">{{ overlayModeHint }}</span>
+                        </div>
+                        <!-- 叠加画面: 图A底图固定，图B按偏移叠加 (或画布差值合成)，精细对齐完成后可点击取点 -->
+                        <div class="overlay-stage" ref="overlayStageRef" @click="onOverlayClick" :style="{ cursor: overlayFineDone ? 'crosshair' : 'default' }">
+                            <img :src="calibImageA.src" ref="overlayBaseImgRef" @load="onOverlayImgLoad" :style="{ filter: overlayBlendMode === 'gray' ? 'grayscale(1)' : 'none' }" alt="图A (底图)">
+                            <img :src="calibImageB.src" ref="overlayBImgRef" @load="onOverlayImgLoad" :style="overlayImgBStyle" alt="图B (叠加)">
+                            <canvas v-show="overlayBlendMode === 'difference'" ref="overlayDiffCanvasRef" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;"></canvas>
+                            <canvas ref="overlayCanvasRef" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;"></canvas>
+                        </div>
+                        <!-- X/Y 偏移滑块 -->
+                        <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 12px;">
+                            <div style="display: flex; align-items: center; gap: 10px;">
+                                <label style="width: 80px; font-size: 12px; color: #666;">水平偏移 Δx</label>
+                                <input type="range" style="flex: 1;" :min="-overlayMaxX" :max="overlayMaxX" step="1" v-model.number="overlayDx" @input="onOverlayOffsetInput">
+                                <span style="width: 70px; text-align: right; font-family: monospace; font-size: 12px;">{{ overlayDxText }} px</span>
+                            </div>
+                            <div style="display: flex; align-items: center; gap: 10px;">
+                                <label style="width: 80px; font-size: 12px; color: #666;">垂直偏移 Δy</label>
+                                <input type="range" style="flex: 1;" :min="-overlayMaxY" :max="overlayMaxY" step="1" v-model.number="overlayDy" @input="onOverlayOffsetInput">
+                                <span style="width: 70px; text-align: right; font-family: monospace; font-size: 12px;">{{ overlayDyText }} px</span>
+                            </div>
+                        </div>
+                        <!-- 实时重合度残差: 拖滑块防抖异步重算，越小说明叠得越准 (相对比较，拖到最小即对齐) -->
+                        <div style="display: flex; align-items: center; gap: 10px; margin-top: 8px;">
+                            <label style="width: 80px; font-size: 12px; color: #666;">重合度残差</label>
+                            <span :style="overlayScoreStyle">{{ overlayScoreText }}</span>
+                            <span style="font-size: 11px; color: #999;">{{ overlayScoreHint }} (数值越小=叠得越准)</span>
+                        </div>
+                        <!-- 操作按钮 -->
+                        <div style="display: flex; align-items: center; gap: 12px; margin-top: 12px; flex-wrap: wrap;">
+                            <button class="calibration-upload-btn" style="background: linear-gradient(135deg, #667eea, #764ba2);" :disabled="overlayMatchBusy || overlayFineBusy || overlayCheckBusy || !cvReady" @click="runOverlayOneClickAlign">
+                                {{ overlayMatchBusy ? '⏳ 重叠中…' : '🪄 一键重叠' }}
+                            </button>
+                            <button class="calibration-upload-btn" style="background: #95a5a6;" @click="resetOverlayShift">↺ 一键复位</button>
+                            <button class="calibration-upload-btn" style="background: linear-gradient(135deg, #2980b9, #667eea);" :disabled="overlayMatchBusy || overlayCheckBusy || overlayFineBusy || !cvReady" @click="runOverlayCheck">
+                                {{ overlayCheckBusy ? '⏳ 检查中…' : '🔍 检查对齐' }}
+                            </button>
+                            <button class="calibration-upload-btn" style="background: linear-gradient(135deg, #27ae60, #2ecc71);" :disabled="overlayMatchBusy || overlayFineBusy || overlayCheckBusy || !cvReady" @click="runOverlayFineAlign">
+                                {{ overlayFineBusy ? '⏳ 微调中…' : '🔬 精细对齐' }}
+                            </button>
+                            <button class="calibration-upload-btn" style="background: linear-gradient(135deg, #e74c3c, #c0392b);" :disabled="overlayAutoPickBusy || overlayMatchBusy || overlayFineBusy || overlayCheckBusy || !cvReady" @click="autoPickCalibPoint">
+                                {{ overlayAutoPickBusy ? '⏳ 取点中…' : '🎯 自动取点 (测量移动像素距离)' }}
+                            </button>
+                            <span v-if="overlayFineDone" style="font-size: 12px; color: #27ae60;">✔ 精细对齐完成，可点「自动取点」直接填表，或点击叠加画面手动取点</span>
+                            <span v-else-if="overlayMatchBusy" style="font-size: 12px; color: #8e44ad;">⏳ 正在自动重叠两图重复部分…</span>
+                            <span v-else style="font-size: 12px; color: #999;">推荐先点「一键重叠」自动对齐；手动拖滑块时点「检查对齐」确认</span>
+                        </div>
+                        <!-- 精细对齐状态/结果直接显示在卡片内 (标定页无日志面板) -->
+                        <div v-if="overlayFineMsg" :style="overlayFineMsgStyle">{{ overlayFineMsg }}</div>
+                        <div class="calibration-hint">
+                            💡 <b>推荐流程</b>：上传两图后直接点 <b>一键重叠</b>——系统自动找到两图共同的环纹区域并叠合 (圆心拟合→模板匹配→ORB 三级级联，两三百像素的大偏移也能自动识别)，随后自动接精细对齐取亚像素精度。
+                            环纹具有自相似性，肉眼可能在多个位置都"看似重叠"，请以 <b>重合度残差</b> (越小=越准) 与 <b>检查对齐</b> (权威结论+偏差方向+圆心标记) 为准。
+                            也可手动拖滑块 (方向键微调, Shift+方向键=5px；建议切 <b>差值模式</b> 把画面调到最暗)，再点 <b>精细对齐</b> 收尾。精细对齐完成后，点 <b>自动取点 (测量移动像素距离)</b> 一键直接得到表格该行全部数据 (无需点击画面)；也可在叠加画面上点击同一特征点手动取点。
+                        </div>
+                    </template>
                 </div>
 
                 <!-- 空状态提示 -->
                 <div v-if="!calibImageA && !calibImageB" class="card" style="text-align: center; padding: 60px 20px;">
                     <div style="font-size: 48px; margin-bottom: 15px; opacity: 0.3;">📷</div>
                     <p style="font-size: 16px; color: #999; margin-bottom: 8px;">尚未上传标定图片</p>
-                    <p style="font-size: 13px; color: #bbb;">请分别上传图A和图B，然后在两张图上标记同一特征点</p>
+                    <p style="font-size: 13px; color: #bbb;">请分别上传图A和图B，完成叠加对齐后在叠加画面上点击特征点</p>
                 </div>
 
-                <!-- 叠加显示与点击选点区域 -->
+                <!-- 测量结果: 特征点表格 (单组一行) + 像素距离 + 标定值 -->
                 <div class="card" v-if="calibImageA || calibImageB">
-                    <h3 style="color: #333; margin-bottom: 10px;">
-                        点击标记特征点
-                        <span style="font-size: 12px; color: #999; margin-left: 10px;">
-                            {{ calibPointA ? '✅ A点已标记' : '⬜ 请在图A上点击特征点' }}
-                            &nbsp;|&nbsp;
-                            {{ calibPointB ? '✅ B点已标记' : '⬜ 请在图B上点击特征点' }}
-                        </span>
-                        <span v-if="calibPointA || calibPointB" style="font-size: 11px; color: #667eea; margin-left: 10px;">
-                            ⌨️ 方向键微调当前标记 (Shift+方向键=5px)
-                            &nbsp;|&nbsp;
-                            当前调整: <b>{{ calibActiveSlot === 'A' ? '图A' : '图B' }}</b>
-                        </span>
+                    <h3 style="color: #333; margin-bottom: 15px;">
+                        📊 测量结果
+                        <span style="font-size: 12px; color: #999; margin-left: 10px;">精细对齐完成后，点「自动取点」一键填充表格；也可在叠加画面上点击同一特征点手动取点 (每次替换上一次)</span>
                     </h3>
-                    <div style="display: flex; gap: 15px; flex-wrap: wrap;">
-                        <!-- 图A选点区 -->
-                        <div style="flex: 1; min-width: 300px;">
-                            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 5px;">
-                                <p style="font-size: 12px; color: #667eea; font-weight: bold; margin: 0;">图A - 点击选择特征点</p>
-                                <label style="font-size: 11px; color: #999; margin-left: auto;">鼓轮刻度:</label>
-                                <input type="number" v-model.number="calibScaleA" step="0.001" placeholder="mm" style="width: 100px; padding: 4px 6px; border: 1px solid #667eea; border-radius: 3px; font-size: 12px; text-align: right;">
-                            </div>
-                            <div class="calibration-overlay-container" ref="calibContainerA" @click="onCalibClickA">
-                                <img v-if="calibImageA" :src="calibImageA.src" alt="图A">
-                                <canvas ref="calibCanvasA" style="pointer-events: none;"></canvas>
-                                <div v-if="!calibImageA" style="display: flex; align-items: center; justify-content: center; height: 300px; color: #999;">请先上传图片A</div>
-                            </div>
-                        </div>
-                        <!-- 图B选点区 -->
-                        <div style="flex: 1; min-width: 300px;">
-                            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 5px;">
-                                <p style="font-size: 12px; color: #764ba2; font-weight: bold; margin: 0;">图B - 点击选择特征点</p>
-                                <label style="font-size: 11px; color: #999; margin-left: auto;">鼓轮刻度:</label>
-                                <input type="number" v-model.number="calibScaleB" step="0.001" placeholder="mm" style="width: 100px; padding: 4px 6px; border: 1px solid #764ba2; border-radius: 3px; font-size: 12px; text-align: right;">
-                            </div>
-                            <div class="calibration-overlay-container" ref="calibContainerB" @click="onCalibClickB">
-                                <img v-if="calibImageB" :src="calibImageB.src" alt="图B">
-                                <canvas ref="calibCanvasB" style="pointer-events: none;"></canvas>
-                                <div v-if="!calibImageB" style="display: flex; align-items: center; justify-content: center; height: 300px; color: #999;">请先上传图片B</div>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="calibration-hint">
-                        💡 提示: 在两张图上分别点击同一个物理特征点。点击某张图后，可用 <b>方向键</b> 微调标记位置（按住 Shift 每次移动 5px）。
-                    </div>
-                </div>
 
-                <!-- 测量结果 -->
-                <div class="card" v-if="calibPointA && calibPointB">
-                    <h3 style="color: #333; margin-bottom: 15px;">📊 测量结果</h3>
-                    <div class="calibration-result">
-                        <div class="calibration-metric">
-                            <label>ΔX (像素)</label>
-                            <div class="value">{{ calibDeltaX.toFixed(2) }}</div>
-                        </div>
-                        <div class="calibration-metric">
-                            <label>ΔY (像素)</label>
-                            <div class="value">{{ calibDeltaY.toFixed(2) }}</div>
-                        </div>
+                    <!-- 特征点表格 (单组模式，最多一行) -->
+                    <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                        <thead>
+                            <tr style="background: #f0f2ff;">
+                                <th style="padding: 8px; border: 1px solid #ddd;">序号</th>
+                                <th style="padding: 8px; border: 1px solid #ddd;">图A坐标 (px)</th>
+                                <th style="padding: 8px; border: 1px solid #ddd;">图B坐标 (px)</th>
+                                <th style="padding: 8px; border: 1px solid #ddd;">ΔX (px)</th>
+                                <th style="padding: 8px; border: 1px solid #ddd;">ΔY (px)</th>
+                                <th style="padding: 8px; border: 1px solid #ddd;">像素距离 (px)</th>
+                                <th style="padding: 8px; border: 1px solid #ddd;">标定值 (mm/像素)</th>
+                                <th style="padding: 8px; border: 1px solid #ddd;">操作</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr v-if="!calibPairRows.length">
+                                <td colspan="8" style="padding: 18px; text-align: center; color: #999; border: 1px solid #ddd;">
+                                    暂无特征点 —— 精细对齐后点「自动取点 (测量移动像素距离)」一键填充，或在叠加画面上点击同一特征点
+                                </td>
+                            </tr>
+                            <tr v-for="row in calibPairRows" :key="row.id">
+                                <td style="padding: 6px 8px; border: 1px solid #eee; text-align: center; font-weight: bold; color: #e74c3c;">{{ row.id + 1 }}</td>
+                                <td style="padding: 6px 8px; border: 1px solid #eee; text-align: center; font-family: monospace; font-size: 12px;">({{ row.ax.toFixed(3) }}, {{ row.ay.toFixed(3) }})</td>
+                                <td style="padding: 6px 8px; border: 1px solid #eee; text-align: center; font-family: monospace; font-size: 12px;">({{ row.bx.toFixed(3) }}, {{ row.by.toFixed(3) }})</td>
+                                <td style="padding: 6px 8px; border: 1px solid #eee; text-align: center; font-family: monospace;">{{ row.dx.toFixed(3) }}</td>
+                                <td style="padding: 6px 8px; border: 1px solid #eee; text-align: center; font-family: monospace;">{{ row.dy.toFixed(3) }}</td>
+                                <td style="padding: 6px 8px; border: 1px solid #eee; text-align: center; font-family: monospace; font-weight: bold; color: #e74c3c;">{{ row.dist.toFixed(3) }}</td>
+                                <td style="padding: 6px 8px; border: 1px solid #eee; text-align: center; font-family: monospace; color: #27ae60;">{{ row.value > 0 ? row.value.toFixed(6) : '—' }}</td>
+                                <td style="padding: 6px 8px; border: 1px solid #eee; text-align: center;">
+                                    <button class="calibration-upload-btn" style="background: #e74c3c; padding: 3px 8px; font-size: 11px;" @click="removeCalibPair(row.id)">删除</button>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <!-- 像素距离 + 清空 -->
+                    <div style="display: flex; align-items: center; gap: 15px; margin-top: 12px; flex-wrap: wrap;">
                         <div class="calibration-metric" style="border-left-color: #e74c3c;">
                             <label>像素距离 (px)</label>
-                            <div class="value" style="color: #e74c3c;">{{ calibPixelDistance.toFixed(2) }}</div>
+                            <div class="value" style="color: #e74c3c;">{{ calibAvgDistance > 0 ? calibAvgDistance.toFixed(3) : '—' }}</div>
                         </div>
+                        <button v-if="calibPairRows.length" class="calibration-upload-btn" style="background: #95a5a6;" @click="clearCalibPairs">🗑️ 清空特征点</button>
                     </div>
 
-                    <!-- 物理距离：自动差值 + 手动覆盖 -->
+                    <!-- 物理距离: 在上方图A/图B处填入读数显微镜刻度后自动计算填入，也支持直接手动输入 -->
                     <div style="margin-top: 20px;">
-                        <div style="display: flex; align-items: center; gap: 15px; flex-wrap: wrap; margin-bottom: 10px;">
-                            <label style="font-weight: bold; color: #333;">鼓轮刻度差 (mm):</label>
-                            <span style="font-size: 16px; color: #e74c3c; font-weight: bold;">
-                                {{ calibAutoDistance > 0 ? calibAutoDistance.toFixed(3) : '—' }}
-                            </span>
-                            <span v-if="calibScaleA != null && calibScaleB != null" style="font-size: 12px; color: #999;">
-                                = |{{ calibScaleA }} − {{ calibScaleB }}|
-                            </span>
-                        </div>
                         <div style="display: flex; align-items: center; gap: 15px; flex-wrap: wrap;">
                             <label style="font-weight: bold; color: #333;">实际移动距离 (mm):</label>
-                            <input type="number" v-model.number="calibDistanceManual" step="0.001" min="0" :placeholder="calibAutoDistance > 0 ? calibAutoDistance.toFixed(3) + ' (自动)' : '输入物理距离'" style="width: 200px; padding: 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px;">
-                            <span v-if="calibAutoDistance > 0" style="font-size: 12px; color: #27ae60;">✔ 刻度变化时自动更新，可手动修改覆盖</span>
+                            <input type="number" v-model.number="calibDistanceManual" step="0.001" min="0" placeholder="填入图A/图B刻度后自动计算，也可手动输入" style="width: 260px; padding: 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px;">
+                            <span v-if="calibAutoDistance > 0" style="font-size: 12px; color: #27ae60;">✔ 由图A/图B刻度自动算出 ({{ calibAutoDistance.toFixed(3) }} mm)，刻度变化时自动更新，可手动修改覆盖</span>
+                            <span v-else style="font-size: 12px; color: #999;">在上方图片A/图片B旁填入当时对应的读数显微镜刻度，这里会自动计算并填入</span>
                         </div>
                     </div>
 
-                    <!-- 标定值结果 -->
+                    <!-- 标定值结果: 物理距离 ÷ 像素距离 -->
                     <div class="calibration-metric" style="margin-top: 15px; border-left-color: #27ae60; background: #eafaf1;">
-                        <label>标定值 (mm/像素)</label>
+                        <label>标定值 (mm/像素) = 物理距离 ÷ 像素距离</label>
                         <div class="value" style="color: #27ae60; font-size: 22px;">
                             {{ calibValue > 0 ? calibValue.toFixed(6) : '—' }}
                         </div>
                         <small style="color: #666; margin-top: 5px; display: block;">
-                            {{ calibValue > 0 ? `即 1像素 = ${calibValue.toFixed(6)} mm` : '请输入物理距离以计算标定值' }}
+                            {{ calibValue > 0 ? `即 1像素 = ${calibValue.toFixed(6)} mm` : (calibPairRows.length ? '请输入物理距离以计算标定值' : '请先在叠加画面上取点') }}
                         </small>
                     </div>
 
