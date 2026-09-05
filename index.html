@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>牛顿环实验测量工具</title>
+    <title>牛顿环数字化智能测量系统</title>
     <style>
         /* Vue v-cloak: 避免模板闪烁 */
         [v-cloak] { display: none; }
@@ -113,6 +113,8 @@
         .calibration-hint { padding: 10px; background: #fff3cd; border-radius: 6px; font-size: 13px; color: #856404; margin-top: 10px; }
         .overlay-stage { position: relative; border: 1px solid #ddd; border-radius: 4px; overflow: hidden; background: #111; }
         .overlay-stage > img:first-child { display: block; width: 100%; height: auto; }
+        /* 截取区可聚焦以接收键盘操作 (点一下画面或拖动红圈即获焦)，聚焦时高亮描边提示键盘已接管 */
+        .crop-stage:focus { outline: 2px solid #667eea; outline-offset: 2px; }
 
         /* Responsive */
         @media (max-width: 768px) { .grid-2 { grid-template-columns: 1fr; } .grid-auto { grid-template-columns: 1fr; } }
@@ -158,8 +160,8 @@
         <div class="container">
             <!-- Header -->
             <div class="header">
-                <h1>🔬 牛顿环实验测量工具 V1.0.2</h1>
-                <p>基于 OpenCV 的自动图像识别与曲率半径计算系统</p>
+                <h1>🔬 牛顿环数字化智能测量系统</h1>
+                <p>基于 OpenCV 的透镜曲率半径检测与误差评定工具</p>
                 <p style="margin-top: 10px;">
                     <a href="readme.html" target="_blank" style="color: white; text-decoration: underline; opacity: 0.9; font-size: 14px;">📖 查看使用文档</a>
                 </p>
@@ -167,11 +169,11 @@
 
             <!-- Tab Navigation -->
             <div class="tab-nav">
-                <button class="tab-btn" :class="{ active: activeTab === 'rings' }" @click="activeTab = 'rings'">🔬 牛顿环识别</button>
-                <button class="tab-btn" :class="{ active: activeTab === 'calibration' }" @click="activeTab = 'calibration'">📏 像素标定值测定</button>
+                <button class="tab-btn" :class="{ active: activeTab === 'calibration' }" @click="activeTab = 'calibration'">📏 像素标定与位移测算</button>
+                <button class="tab-btn" :class="{ active: activeTab === 'rings' }" @click="activeTab = 'rings'">🔬 环纹识别与人机校验</button>
             </div>
 
-            <!-- Tab 1: 牛顿环识别 -->
+            <!-- Tab 2: 环纹识别与人机校验 -->
             <div class="content" v-show="activeTab === 'rings'">
                 <!-- Image Thumbnails -->
                 <div class="processed-images-list card" v-if="processedImages.length > 0">
@@ -398,12 +400,66 @@
                         </table>
                     </div>
 
-                    <!-- Average Radius -->
+                    <!-- Average Radius (含不确定度) -->
                     <div class="avg-radius-card card">
-                        <h3>📈 平均曲率半径</h3>
-                        <p>
-                            {{ averageRadius > 0 ? averageRadius.toFixed(3) + ' m' : '-' }}
+                        <h3>📈 平均曲率半径 (含不确定度)</h3>
+                        <p v-if="radiusUncertainty && radiusUncertainty.valid" style="font-size: 20px; font-weight: bold; color: #333;">
+                            R = ({{ radiusUncertainty.meanText }} ± {{ radiusUncertainty.uText }}) m
                         </p>
+                        <p v-else-if="averageRadius > 0">{{ averageRadius.toFixed(3) }} m</p>
+                        <p v-else>-</p>
+                        <!-- 不确定度评定明细: 扩展不确定度 U = k·u_C (P=0.95), 相对不确定度与A/B类分量 -->
+                        <div v-if="radiusUncertainty && radiusUncertainty.valid" style="margin-top: 10px; font-size: 12px; color: #666; line-height: 1.9; text-align: left;">
+                            <div>扩展不确定度 U = k·u<sub>C</sub>，置信概率 P = 0.95，包含因子 k = {{ radiusUncertainty.kText }}</div>
+                            <div>相对不确定度 U/R = {{ radiusUncertainty.relativeText }}　（有效分组数 k = {{ radiusUncertainty.k }}）</div>
+                            <div style="color: #999; margin-top: 4px; border-top: 1px dashed #ddd; padding-top: 6px;">
+                                A类 u<sub>A</sub> = {{ radiusUncertainty.uAText }} m（多组统计）　|　
+                                B类 u<sub>B</sub> = {{ radiusUncertainty.uBText }} m（仪器误差传播）　|　
+                                合成 u<sub>C</sub> = {{ radiusUncertainty.uCText }} m
+                            </div>
+                        </div>
+                        <!-- 点开展开不确定度计算过程 (按五步评定, 代入实际数值) -->
+                        <details v-if="radiusUncertainty && radiusUncertainty.valid" style="margin-top: 10px; text-align: left;">
+                            <summary style="cursor: pointer; font-size: 12px; color: #667eea; font-weight: bold;">🔍 点开查看不确定度计算过程</summary>
+                            <div style="margin-top: 8px; font-size: 12px; color: #555; line-height: 1.9; background: #f8f9fb; border: 1px solid #e3e6ee; border-radius: 6px; padding: 10px 12px;">
+                                <div style="font-weight: bold; color: #333;">1. 直径 D 的 B 类不确定度</div>
+                                <div>一次直径测量需读 2 次显微镜刻度（左、右），单次读数示值误差限 Δ = {{ radiusUncertainty.deltaInstrument }} mm，均匀分布：</div>
+                                <div style="font-family: monospace;">u_B(x) = Δ/√3 = {{ radiusUncertainty.deltaInstrument }}/√3 = {{ radiusUncertainty.uBxText }} mm</div>
+                                <div style="font-family: monospace;">u_B(D) = √2·u_B(x) = √2·{{ radiusUncertainty.uBxText }} ≈ {{ radiusUncertainty.uBDText }} mm</div>
+                                <div style="font-weight: bold; color: #333; margin-top: 8px;">2. R 的 B 类相对不确定度（逐组）</div>
+                                <div style="font-family: monospace;">u_B(R)/R = 2·u_B(D)/(D_m²−D_n²)·√(D_m²+D_n²)，u_B(R) = R·(u_B(R)/R)</div>
+                                <table style="width: 100%; border-collapse: collapse; margin-top: 4px; font-size: 11px; text-align: center;">
+                                    <thead><tr><th style="border-bottom: 1px solid #ddd; padding: 2px;">分组</th><th style="border-bottom: 1px solid #ddd; padding: 2px;">D_m (mm)</th><th style="border-bottom: 1px solid #ddd; padding: 2px;">D_n (mm)</th><th style="border-bottom: 1px solid #ddd; padding: 2px;">D_m²−D_n²</th><th style="border-bottom: 1px solid #ddd; padding: 2px;">u_B(R)/R</th><th style="border-bottom: 1px solid #ddd; padding: 2px;">u_B(R)_i (m)</th></tr></thead>
+                                    <tbody>
+                                        <tr v-for="g in radiusUncertainty.perGroup" :key="g.group">
+                                            <td style="padding: 2px;">{{ g.group }}</td>
+                                            <td style="padding: 2px;">{{ g.Dm.toFixed(3) }}</td>
+                                            <td style="padding: 2px;">{{ g.Dn.toFixed(3) }}</td>
+                                            <td style="padding: 2px;">{{ g.diffSq.toFixed(3) }}</td>
+                                            <td style="padding: 2px;">{{ (g.rel * 100).toFixed(3) }}%</td>
+                                            <td style="padding: 2px;">{{ g.uBR.toExponential(2) }}</td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                                <div style="font-family: monospace;">取各组相对值平均：u_B(R)/R = {{ (radiusUncertainty.uBRel * 100).toFixed(3) }}% ⇒ u_B(R) = R̄·(u_B(R)/R) = {{ radiusUncertainty.uBText }} m</div>
+                                <div style="font-weight: bold; color: #333; margin-top: 8px;">3. A 类不确定度（多组 R_i，k = {{ radiusUncertainty.k }}）</div>
+                                <div style="font-family: monospace;">R̄ = (1/k)ΣR_i = {{ radiusUncertainty.mean.toFixed(4) }} m</div>
+                                <template v-if="radiusUncertainty.k >= 2">
+                                    <div style="font-family: monospace;">Σ(R_i−R̄)² = {{ radiusUncertainty.sumSqDev.toExponential(3) }}</div>
+                                    <div style="font-family: monospace;">u_A(R̄) = [Σ(R_i−R)²/(k(k−1))] = {{ radiusUncertainty.uAText }} m</div>
+                                </template>
+                                <div v-else style="color: #e67e22;">k &lt; 2，无法评定 A 类（u_A = 0）。</div>
+                                <div style="font-weight: bold; color: #333; margin-top: 8px;">4. 合成标准不确定度</div>
+                                <div style="font-family: monospace;">u_C(R) = √[u_A²(R̄) + u_B²(R)] = {{ radiusUncertainty.uCText }} m</div>
+                                <div style="font-weight: bold; color: #333; margin-top: 8px;">5. 扩展不确定度（P = 0.95）</div>
+                                <div style="font-family: monospace;">ν_eff = {{ radiusUncertainty.nuEffText }}，k = t₀.₉₅(ν_eff) = {{ radiusUncertainty.kText }}</div>
+                                <div style="font-family: monospace;">U = k·u_C = {{ radiusUncertainty.uText }} m</div>
+                                <div style="font-weight: bold; color: #27ae60; margin-top: 6px;">最终结果：R = ({{ radiusUncertainty.meanText }} ± {{ radiusUncertainty.uText }}) m，U/R = {{ radiusUncertainty.relativeText }}</div>
+                            </div>
+                        </details>
+                        <div v-if="radiusUncertainty && !radiusUncertainty.valid" style="margin-top: 8px; font-size: 12px; color: #e67e22; text-align: left;">
+                            ⚠️ 不确定度暂无法评定（有效分组 k = {{ radiusUncertainty.k }}，需 ≥2 组且已设定像素标定值）。
+                        </div>
                     </div>
                 </div>
 
@@ -422,14 +478,14 @@
                 <input type="file" ref="fileInputRef" accept="image/*" multiple @change="handleFileUpload" style="display: none;">
             </div>
 
-            <!-- Tab 2: 像素标定值测定 -->
+            <!-- Tab 1: 像素标定与位移测算 -->
             <div class="content" v-show="activeTab === 'calibration'">
                 <!-- 操作说明 -->
                 <div class="card" style="border-left: 4px solid #667eea;">
-                    <h3 style="color: #333; margin-bottom: 8px;">📏 像素标定值测定</h3>
+                    <h3 style="color: #333; margin-bottom: 8px;">📏 像素标定与位移测算</h3>
                     <p style="font-size: 13px; color: #666; line-height: 1.6;">
-                        通过转动测微鼓轮，先后拍摄两张显微镜视野图片。上传后先在图A上框选圆形截取区 (两图用完全相同的位置截取)，
-                        确认后替换为截取图 (不自动重合)，再点「一键重叠」对齐截取图；也可点「一键重叠」直接对齐全图 (或手动拖滑块)。
+                        通过转动测微鼓轮，先后拍摄两张显微镜视野图片。上传后先在图A上框选圆形截取区 (红圈=实际剪下的区域，两图用完全相同的位置截取)，
+                        确认后下方的对齐重叠就只用这块截取区域 (画面按圆形显示，不自动重合)，再点「一键重叠」对齐；也可跳过截取直接对齐全图 (或手动拖滑块)。
                         再在叠加画面上点击同一特征点，系统计算像素距离 (保留 3 位小数)。
                         输入鼓轮实际移动的物理距离，即可算出标定值（mm/像素）。
                     </p>
@@ -493,25 +549,28 @@
                     <div class="card" v-if="cropReady" style="flex: 1 1 480px;">
                     <h3 style="color: #333; margin-bottom: 10px;">
                         ✂️ 圆形截取 (两图同位置)
-                        <span style="font-size: 12px; color: #999; margin-left: 10px;">在图A上拖拽红色圆圈选择截取范围，图B自动使用完全相同的圆心与半径；确认后替换为截取图 (不自动重合)</span>
+                        <span style="font-size: 12px; color: #999; margin-left: 10px;">在图A上拖拽红色圆圈选择截取范围 (红圈即实际剪下的区域)，图B自动使用完全相同的圆心与半径；确认后下方对齐重叠只用这块区域 (不自动重合)</span>
                     </h3>
-                    <div ref="cropStageRef" @mousedown="onCropMouseDown" style="position: relative; display: inline-block; max-width: 100%; overflow: hidden; cursor: move; user-select: none; line-height: 0;">
-                        <img ref="cropBaseImgRef" :src="calibImageA.src" @load="updateOverlayScale" alt="图A (截取基准)" style="display: block; max-width: 100%; height: auto;">
+                    <div ref="cropStageRef" class="crop-stage" tabindex="0" @mousedown="onCropMouseDown" @keydown="onCropKeydown" style="position: relative; display: inline-block; max-width: 100%; overflow: hidden; cursor: move; user-select: none; line-height: 0;">
+                        <img ref="cropBaseImgRef" :src="calibImageA.src" @load="updateDisplayScales" alt="图A (截取基准)" style="display: block; max-width: 100%; height: auto;">
                         <div :style="cropCircleStyle"></div>
                     </div>
                     <div style="display: flex; align-items: center; gap: 12px; margin-top: 12px; flex-wrap: wrap;">
-                        <button class="calibration-upload-btn" style="background: linear-gradient(135deg, #e67e22, #f39c12);" @click="adjustCropRadiusMinus">－ 缩小</button>
+                        <button class="calibration-upload-btn" style="background: linear-gradient(135deg, #e67e22, #f39c12);" @click="adjustCropRadiusMinus" title="等效键盘 − 键">－ 缩小</button>
                         <input type="range" :min="cropRadiusMin" :max="cropRadiusMax" step="1" v-model.number="cropRadius" style="width: 220px;">
-                        <button class="calibration-upload-btn" style="background: linear-gradient(135deg, #e67e22, #f39c12);" @click="adjustCropRadiusPlus">＋ 放大</button>
-                        <span style="font-size: 12px; color: #666; font-family: monospace;">半径 {{ cropRadius }} px</span>
+                        <button class="calibration-upload-btn" style="background: linear-gradient(135deg, #e67e22, #f39c12);" @click="adjustCropRadiusPlus" title="等效键盘 + 键">＋ 放大</button>
+                        <span style="font-size: 11px; color: #999;">键盘: <b>+/−</b> 调半径 (Shift ±50px)・<b>方向键</b> 移圆心・<b>Home</b> 复位 (先点一下上方画面)</span>
+                        <span style="font-size: 12px; color: #666; font-family: monospace;">{{ cropInfoText }}</span>
                         <button class="calibration-upload-btn" style="background: linear-gradient(135deg, #667eea, #764ba2);" :disabled="cropBusy || !cropReady" @click="confirmCrop">
                             {{ cropBusy ? '⏳ 截取中…' : '✂️ 确认截取' }}
                         </button>
                     </div>
                     <div v-if="cropMsg" style="margin-top: 8px; font-size: 13px; color: #667eea; font-weight: bold;">{{ cropMsg }}</div>
                     <div class="calibration-hint">
-                        💡 拖动红色圆圈把截取范围对准要重叠的环纹区域，点 <b>－/＋</b> (或拖滑块) 调整半径。点击 <b>确认截取</b> 后，两图按完全相同的位置截成圆形图 (不会自动重合)，再到下方叠加对齐卡片点 <b>一键重叠</b> 或手动拖滑块对齐。
-                        截取后如需重选区域，点上方 <b>恢复原图</b>。截取图也可跳过本步，直接在下方叠加对齐卡片手动处理。
+                        💡 拖动红色圆圈把截取范围对准要重叠的环纹区域，半径三种方式任选: 拖 <b>滑块</b>、点 <b>－/＋</b> 按钮、或按键盘 <b>+/−</b> (Shift 加速 ±50px，在截取画面上还能用 <b>方向键</b> 移圆心、<b>Home</b> 复位)。半径范围 20px ~ 短边一半；圆靠边时会自动把圆心往回推而不会强行压小半径。红圈按「占原图的百分比」定位，<b>圈到哪就剪到哪</b>，上方读数即实际截取的像素范围。
+                        点 <b>确认截取</b> 后，两图按完全相同的位置剪下同一块方形区域 (不会自动重合)，下方叠加画面按 <b>圆形</b> 显示它 (内切圆就是你框选的那个圆)，再点 <b>一键重叠</b> 或拖滑块对齐。
+                        之所以存方形像素而不是圆形抠图：圆形抠图圆外是透明的，算法读图时透明会被当成纯黑，那条人工圆边在两图里位置完全相同，会把对齐锁死在「偏移≈0」而环纹依旧错开。
+                        截取后如需重选区域，点上方 <b>恢复原图</b>。也可跳过本步，直接在下方叠加对齐卡片处理整图。
                     </div>
                 </div>
                 </div>
@@ -520,7 +579,7 @@
                 <div class="card" v-if="calibImageA && calibImageB">
                     <h3 style="color: #333; margin-bottom: 10px;">
                         🔍 叠加对齐 (一键重叠 / 手动粗对齐 + 精细对齐)
-                        <span style="font-size: 12px; color: #999; margin-left: 10px;">当前操作对象: {{ calibCroppedOriginals ? '截取图' : '原始图' }}。图A固定，图B半透明叠加，点「一键重叠」自动对齐重复部分，或拖动滑块/方向键手动对齐</span>
+                        <span style="font-size: 12px; color: #999; margin-left: 10px;">当前操作对象: {{ calibIsCropped ? '截取图' : '原始图' }}。图A固定，图B半透明叠加，点「一键重叠」自动对齐重复部分，或拖动滑块/方向键手动对齐</span>
                     </h3>
                     <div v-if="overlaySizeMismatch" class="calibration-hint" style="background: #fdecea; color: #c0392b;">
                         ⚠️ 两张图片尺寸不一致，无法叠加对齐。请使用同一机位拍摄的两张图片。
@@ -535,7 +594,7 @@
                             <span style="font-size: 11px; color: #999;">{{ overlayModeHint }}</span>
                         </div>
                         <!-- 叠加画面: 图A底图固定，图B按偏移叠加 (或画布差值合成)，精细对齐完成后可点击取点 -->
-                        <div class="overlay-stage" ref="overlayStageRef" @click="onOverlayClick" :style="{ cursor: overlayFineDone ? 'crosshair' : 'default' }">
+                        <div class="overlay-stage" ref="overlayStageRef" @click="onOverlayClick" :style="overlayStageStyle">
                             <img :src="calibImageA.src" ref="overlayBaseImgRef" @load="onOverlayImgLoad" :style="{ filter: overlayBlendMode === 'gray' ? 'grayscale(1)' : 'none' }" alt="图A (底图)">
                             <img :src="calibImageB.src" ref="overlayBImgRef" @load="onOverlayImgLoad" :style="overlayImgBStyle" alt="图B (叠加)">
                             <canvas v-show="overlayBlendMode === 'difference'" ref="overlayDiffCanvasRef" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;"></canvas>
@@ -670,7 +729,7 @@
 
                     <!-- 应用到牛顿环 -->
                     <button v-if="calibValue > 0" class="btn" style="margin-top: 15px; background: linear-gradient(135deg, #27ae60, #2ecc71);" @click="applyCalibration">
-                        ✅ 应用此标定值到牛顿环识别
+                        ✅ 应用此标定值到环纹识别与人机校验
                     </button>
                 </div>
             </div>
