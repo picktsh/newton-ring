@@ -814,6 +814,41 @@ function applyMedianBlur(srcMat, kernelSize = 5) {
   return filteredMat;
 }
 
+// 标定图预处理 (仅用于显示层增强，帮助人眼捕捉特征点)
+// 管线: 灰度 → 中值滤波去噪(3) → CLAHE 局部对比度 → Unsharp 锐化
+// 保证: 全部为同尺寸逐像素值运算，不改变任何像素的几何位置，特征点坐标处理前后完全一致；
+//       原图数据由调用方单独保留，本函数只处理传入副本并返回新 Mat (调用方负责 delete)
+export function preprocessCalibForDisplay(srcMat, { claheStrength = 2.5, sharpenSigma = 1.2 } = {}) {
+  let gray = null, denoised = null, enhanced = null, blurred = null;
+  try {
+    gray = new cv.Mat();
+    if (srcMat.channels() > 1) {
+      cv.cvtColor(srcMat, gray, cv.COLOR_BGR2GRAY);
+    } else {
+      srcMat.copyTo(gray);
+    }
+    denoised = applyMedianBlur(gray, 3);
+    enhanced = applyCLAHE(denoised, claheStrength, 16);
+    // Unsharp 锐化: 结果 = 1.5×增强图 − 0.5×高斯模糊图 (温和参数，避免过冲产生假边缘)
+    blurred = new cv.Mat();
+    cv.GaussianBlur(enhanced, blurred, new cv.Size(0, 0), sharpenSigma);
+    const sharp = new cv.Mat();
+    cv.addWeighted(enhanced, 1.5, blurred, -0.5, 0, sharp);
+    // 尺寸校验关卡: 处理后必须与原图宽高完全一致，否则丢弃结果 (保证特征点坐标有效)
+    if (sharp.cols !== srcMat.cols || sharp.rows !== srcMat.rows) {
+      const msg = `尺寸校验失败 (${sharp.cols}x${sharp.rows} ≠ ${srcMat.cols}x${srcMat.rows})`;
+      sharp.delete();
+      throw new Error(msg);
+    }
+    return sharp;
+  } finally {
+    gray?.delete();
+    denoised?.delete();
+    enhanced?.delete();
+    blurred?.delete();
+  }
+}
+
 // 自适应阈值二值化
 function applyAdaptiveThreshold(srcMat, blockSize = 15, C = 2, thresholdType = cv.THRESH_BINARY_INV) {
   const binaryMat = new cv.Mat();
