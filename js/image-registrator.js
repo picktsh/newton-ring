@@ -1,0 +1,1400 @@
+// @ts-ignore
+/* global cv */
+
+// ===== 像素标定自动配准模块 =====
+// 四级降级: ① 局部模板匹配 → ② 牛顿环圆心拟合 → ③ ORB+RANSAC → ④ 相位相关 → 全部不可信由上层回退手动
+// 另有 ⑤ refineTranslationNear: 人工粗对齐后的局部小范围精细微调 (供叠加对齐模式调用)
+// 另有 ⑥ refineTranslationByRings: 基于多环圆心拟合的精细对齐 (环半径全局唯一，免疫局部自相似歧义，叠加对齐首选通路)
+// 统一返回结构:
+//   { ok, method, dx, dy, lowConfidence, message, detail?,
+//     score, templateRect,                            // 模板匹配专属: 得分与模板区域
+//     centerA, centerB, ringsA, ringsB,               // 圆心拟合专属: 两图拟合圆心与圆环数
+//     inlierCount, matchPairs, pointA, pointB }       // 各通路填充的标记点对
+// 约定: dx, dy 为 B 相对 A 的平移 (B点 = A点 + (dx, dy))
+
+const DEFAULT_OPTIONS = {
+  // 通用
+  zeroShiftThreshold: 2.0,   // 合成位移模长低于该值视为近零，所有通路统一过滤
+  // ① 局部模板匹配
+  templateSizeRatio: 0.14,   // 模板边长 = 短边 × 该比例
+  scoreReject: 0.55,         // 得分低于该值判失效，流转下一算法
+  scoreWarn: 0.75,           // 得分介于 reject~warn 输出低置信
+  templateCount: 3,          // 选取多个空间分离模板做位移一致性验证 (比次峰阈值更抗周期纹理)
+  consistencyThreshold: 3.0, // 多模板位移两两最大允许差 (像素)
+  secondPeakRatio: 0.97,     // 次峰 ≥ 主峰×该比例且多模板不一致时判歧义 (环纹自相似，阈值需极严)
+  peakNeighborhood: 2.0,     // 次峰搜索排除主峰邻域 = 该倍数 × 模板边长
+  // ② 圆心拟合
+  minRings: 4,               // 可信所需最少圆环数
+  maxDispersion: 6.0,        // 逐环圆心相对合成圆心最大允许离散度 (像素)，超出判低质
+  lowDispersion: 3.6,        // 离散度超过该值但低于 max 时降级为低置信
+  // ③ ORB + RANSAC
+  maxFeatures: 1500,
+  ransacIters: 800,
+  inlierThreshold: 4.0,      // RANSAC 内点容差 (像素)
+  minInliers: 8,
+  maxMatchDistance: 50,      // 汉明匹配距离上限
+  blurSize: 5,
+  centralMaskRatio: 0.35,    // 中央环纹屏蔽盘半径比例 (优先边缘灰尘/划痕特征)
+  sparseHoleRatio: 0.008,    // 稀疏采样孔尺寸比例 (孔间距=4倍孔径)
+  crosshairMargin: 12,       // ORB 掩码叉丝带外扩屏蔽宽度
+  maxMatchDim: 1600,         // 最长边超过该值先缩小再提点匹配 (保证页面可响应)，坐标按比例换算回原图；0=不缩小
+  ransacSampleCap: 1500,     // 匹配对超过该数时抽样跑 RANSAC (再用求得的位移回扫全部匹配对内点)
+  // ④ 相位相关
+  peakReject: 0.05,          // 相关峰低于该值判失效
+  peakWarn: 0.15,            // 相关峰介于 reject~warn 输出低置信结果
+  secondaryPeakRatio: 0.5    // 伪零峰时次峰需 ≥ 主峰×该比例才采信
+};
+
+// ---------- 公共工具 ----------
+function median(arr) {
+  const s = [...arr].sort((a, b) => a - b);
+  const m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+
+export function loadImageEl(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error('配准图像加载失败'));
+    img.src = src;
+  });
+}
+
+function toGrayMat(imgEl) {
+  const src = cv.imread(imgEl);
+  const gray = new cv.Mat();
+  try {
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    return gray.clone();
+  } finally {
+    src.delete();
+    gray.delete();
+  }
+}
+
+// 叉丝候选线检测: 行/列均值剖面邻域反差 + 窄线带宽约束
+function findDarkLine(means) {
+  const n = means.length;
+  const lo = Math.floor(n * 0.3), hi = Math.ceil(n * 0.7);
+  const side = Math.max(5, Math.round(n * 0.02));
+  let bestIdx = -1, bestContrast = 0;
+  for (let i = lo; i < hi; i++) {
+    const contrast = Math.min(means[Math.max(0, i - side)], means[Math.min(n - 1, i + side)]) - means[i];
+    if (contrast > bestContrast) { bestContrast = contrast; bestIdx = i; }
+  }
+  if (bestIdx < 0 || bestContrast < 15) return null;
+  const th = means[bestIdx] + bestContrast * 0.35;
+  let l = bestIdx, r = bestIdx;
+  while (l > 0 && means[l - 1] < th) l--;
+  while (r < n - 1 && means[r + 1] < th) r++;
+  if (r - l + 1 > 8) return null;
+  return { pos: bestIdx, half: Math.max(2, Math.ceil((r - l) / 2) + 1) };
+}
+
+// 贯穿全图验证: 沿线暗点占比 (排除环纹局部相交误报)
+function lineDarkRatio(gray, isVertical, pos) {
+  const rows = gray.rows, cols = gray.cols, data = gray.data;
+  let dark = 0, counted = 0;
+  const len = isVertical ? rows : cols;
+  for (let i = 0; i < len; i++) {
+    const base = isVertical ? data[i * cols + pos] : data[pos * cols + i];
+    // 沿线取邻域比较，跳过整体暗区
+    let nb = 0, cnt = 0;
+    for (let d = -6; d <= 6; d += 3) {
+      const q = pos + d;
+      if (isVertical) { if (q >= 0 && q < cols) { nb += data[i * cols + q]; cnt++; } }
+      else { if (q >= 0 && q < cols) { nb += data[q * cols + i]; cnt++; } }
+    }
+    if (!cnt) continue;
+    const mean = nb / cnt;
+    if (mean < 30) continue;
+    counted++;
+    if (base < mean * 0.8) dark++;
+  }
+  return counted > 0 ? dark / counted : 0;
+}
+
+// 检测固定十字叉丝，返回 { vLine, hLine } (可能为 null)
+function detectCrosshair(gray) {
+  const rows = gray.rows, cols = gray.cols, data = gray.data;
+  const colSum = new Float64Array(cols);
+  const rowSum = new Float64Array(rows);
+  for (let y = 0; y < rows; y++) {
+    const off = y * cols;
+    for (let x = 0; x < cols; x++) {
+      const v = data[off + x];
+      colSum[x] += v;
+      rowSum[y] += v;
+    }
+  }
+  let vLine = findDarkLine(Array.from(colSum, s => s / rows));
+  let hLine = findDarkLine(Array.from(rowSum, s => s / cols));
+  if (vLine && lineDarkRatio(gray, true, vLine.pos) < 0.7) vLine = null;
+  if (hLine && lineDarkRatio(gray, false, hLine.pos) < 0.7) hLine = null;
+  return { vLine, hLine };
+}
+
+// 判断矩形区域是否与叉丝带相交 (含外扩余量)
+function rectHitsCrosshair(x0, y0, x1, y1, vLine, hLine, margin = 4) {
+  if (vLine && x0 < vLine.pos + vLine.half + margin && x1 > vLine.pos - vLine.half - margin) return true;
+  if (hLine && y0 < hLine.pos + hLine.half + margin && y1 > hLine.pos - hLine.half - margin) return true;
+  return false;
+}
+
+// ---------- ① 局部模板匹配配准 (首选算法) ----------
+// 原理: 在图A选取多个空间分离、避开叉丝的环纹弧线子图做模板，在图B各自独立搜索位置。
+// 环纹自相似会让单模板产生多个近似高分位置 (次峰检查在实拍中误杀率高)，
+// 改用多模板位移一致性验证: 真实平移对所有模板一致，伪匹配位置彼此矛盾。
+export async function estimateTranslationByTemplate(calibImageA, calibImageB, options = {}) {
+  const opts = { ...DEFAULT_OPTIONS, ...options };
+  const imgElA = await loadImageEl(calibImageA.src);
+  const imgElB = await loadImageEl(calibImageB.src);
+  let grayA = null, grayB = null;
+  const mats = [];
+  try {
+    grayA = toGrayMat(imgElA);
+    grayB = toGrayMat(imgElB);
+    if (grayA.rows !== grayB.rows || grayA.cols !== grayB.cols) {
+      return { ok: false, method: '模板匹配', message: '两图尺寸不一致' };
+    }
+    const rows = grayA.rows, cols = grayA.cols;
+    const { vLine, hLine } = detectCrosshair(grayA);
+    // 1. 粗定位环系圆心 (仅用于指导模板选位，绝不直接作为配准结果)
+    const rough = roughRingCenter(grayA);
+    if (!rough) return { ok: false, method: '模板匹配', message: '无法粗定位环系，无法选取模板' };
+    // 2. 选取多个空间分离、避开叉丝的高纹理候选块
+    const tSize = Math.max(48, Math.min(176, Math.round(Math.min(cols, rows) * opts.templateSizeRatio)));
+    const candidates = pickTemplateCandidates(grayA, rough, tSize, vLine, hLine, opts.templateCount);
+    console.log(`[自动配准] 模板匹配: ${candidates.length} 个候选模板, 边长=${tSize} [叉丝: ${vLine ? '竖x=' + vLine.pos : '无'} ${hLine ? '横y=' + hLine.pos : '无'}]`);
+    if (!candidates.length) return { ok: false, method: '模板匹配', message: '未找到避开叉丝的合适环纹模板区域' };
+    // 3. 逐模板独立匹配 (注: 当前构建不支持 new cv.Mat(mat, rect)，需用 mat.roi(rect))
+    const results = [];
+    for (const sel of candidates) {
+      const r = matchOneTemplate(grayA, grayB, sel, tSize, mats);
+      if (r) results.push({ sel, ...r });
+    }
+    if (!results.length) return { ok: false, method: '模板匹配', message: '所有模板匹配均失败' };
+    results.sort((a, b) => b.score - a.score);
+    const best = results[0];
+    if (best.score < opts.scoreReject) {
+      return { ok: false, method: '模板匹配', message: `匹配得分过低 (${best.score.toFixed(3)} < ${opts.scoreReject})` };
+    }
+    // 4. 多模板位移一致性验证: 真实平移对所有模板一致，伪匹配 (相邻环自相似) 彼此矛盾
+    let spread = 0;
+    for (let i = 0; i < results.length; i++) {
+      for (let j = i + 1; j < results.length; j++) {
+        spread = Math.max(spread, Math.hypot(results[i].dx - results[j].dx, results[i].dy - results[j].dy));
+      }
+    }
+    if (results.length >= 2 && spread > opts.consistencyThreshold) {
+      return { ok: false, method: '模板匹配', message: `多模板位移不一致 (最大差 ${spread.toFixed(1)}px > ${opts.consistencyThreshold}px)，环纹自相似歧义不可信` };
+    }
+    // 5. 中值合成位移，并检查近零与合理范围 (合成值与单模板一致，不受单点异常影响)
+    let dx = median(results.map(r => r.dx));
+    let dy = median(results.map(r => r.dy));
+    const mag = Math.hypot(dx, dy);
+    if (mag < opts.zeroShiftThreshold) {
+      return { ok: false, method: '模板匹配', message: `模板位移≈0 (${mag.toFixed(2)}px)，疑似未移动或误匹配，不采信` };
+    }
+    if (Math.abs(dx) > cols * 0.6 || Math.abs(dy) > rows * 0.6) {
+      return { ok: false, method: '模板匹配', message: '位移量超出合理范围' };
+    }
+    // 6. 最高分模板主峰 3 点抛物线亚像素精修 (一致性已保证与其他模板吻合，直接采用亚像素峰位)
+    const sub = subpixelPeak(best.result, best.peakX, best.peakY);
+    if (sub) {
+      dx = sub.x + tSize / 2 - (best.sel.x0 + tSize / 2);
+      dy = sub.y + tSize / 2 - (best.sel.y0 + tSize / 2);
+    }
+    console.log(`[自动配准] 模板匹配汇总: ` + results.map(r =>
+      `(${r.sel.x0},${r.sel.y0}) 纹理${r.sel.variance.toFixed(0)} 得分${r.score.toFixed(3)} Δ(${r.dx.toFixed(1)},${r.dy.toFixed(1)})`).join(' | '));
+    console.log(`[自动配准] 模板匹配最终: 一致性差=${spread.toFixed(2)}px, Δx=${dx.toFixed(2)}, Δy=${dy.toFixed(2)}`);
+    const lowConfidence = best.score < opts.scoreWarn;
+    const ax = best.sel.x0 + tSize / 2, ay = best.sel.y0 + tSize / 2;
+    return {
+      ok: true,
+      method: '模板匹配',
+      lowConfidence,
+      dx, dy,
+      score: best.score,
+      detail: `匹配得分 ${best.score.toFixed(3)}, ${results.length}模板一致性 ${spread.toFixed(1)}px${lowConfidence ? ' (得分偏低，请核对)' : ''}`,
+      templateRect: { x0: best.sel.x0, y0: best.sel.y0, size: tSize },
+      pointA: { x: Math.round(ax), y: Math.round(ay) },
+      pointB: { x: Math.round(ax + dx), y: Math.round(ay + dy) }
+    };
+  } catch (e) {
+    return { ok: false, method: '模板匹配', message: e.message || '模板匹配异常' };
+  } finally {
+    for (const m of mats) m.delete();
+    grayA?.delete?.();
+    grayB?.delete?.();
+  }
+}
+
+// 单模板匹配: 提取模板区域并在图B全图归一化互相关搜索，返回得分、峰位与位移；中间 Mat 推入 mats 由调用方释放
+function matchOneTemplate(grayA, grayB, sel, tSize, mats) {
+  const tmpl = grayA.roi(new cv.Rect(sel.x0, sel.y0, tSize, tSize));
+  const result = new cv.Mat();
+  mats.push(tmpl, result);
+  cv.matchTemplate(grayB, tmpl, result, cv.TM_CCOEFF_NORMED);
+  const mm = cv.minMaxLoc(result);
+  const ax = sel.x0 + tSize / 2, ay = sel.y0 + tSize / 2;
+  const dx = mm.maxLoc.x + tSize / 2 - ax;
+  const dy = mm.maxLoc.y + tSize / 2 - ay;
+  return { score: mm.maxVal, peakX: mm.maxLoc.x, peakY: mm.maxLoc.y, dx, dy, result };
+}
+
+// 3 点抛物线峰精修: 主峰非边界时用相邻两行/列拟合亚像素偏移，返回浮点峰位或 null (不可精修)
+function subpixelPeak(result, px, py) {
+  const at = (x, y) => result.data32F[y * result.cols + x];
+  if (px <= 0 || py <= 0 || px >= result.cols - 1 || py >= result.rows - 1) return null;
+  const vx = at(px, py), lx = at(px - 1, py), rx = at(px + 1, py);
+  const vy = at(px, py), ly = at(px, py - 1), ry = at(px, py + 1);
+  const dx = (2 * (lx - rx) !== 0) ? (lx - rx) / (2 * (lx - 2 * vx + rx)) : 0;
+  const dy = (2 * (ly - ry) !== 0) ? (ly - ry) / (2 * (ly - 2 * vy + ry)) : 0;
+  if (!isFinite(dx) || !isFinite(dy) || Math.abs(dx) > 1 || Math.abs(dy) > 1) return null;
+  return { x: px + dx, y: py + dy };
+}
+
+// 环系圆心粗定位: 直方图均衡增强后霍夫圆检测，取可信同心圆圆心加权中位数 (仅用于模板选位参考)
+// 实拍暗场低对比度: 参数经实拍标定 (p2 过严会检出 0；最大半径需覆盖真实外环)
+function roughRingCenter(gray) {
+  const cols = gray.cols, rows = gray.rows;
+  const minDim = Math.min(cols, rows), maxDim = Math.max(cols, rows);
+  const enhanced = enhancedMat(gray);
+  const circles = new cv.Mat();
+  try {
+    cv.HoughCircles(
+      enhanced, circles, cv.HOUGH_GRADIENT,
+      1, minDim * 0.04, 60, 15,
+      Math.round(minDim * 0.04), Math.round(maxDim * 0.45)
+    );
+    const xs = [], ys = [], weights = [];
+    for (let i = 0; i < circles.cols; i++) {
+      const cx = circles.data32F[i * 3], cy = circles.data32F[i * 3 + 1], r = circles.data32F[i * 3 + 2];
+      if (cx < 0 || cy < 0 || cx >= cols || cy >= rows) continue;
+      if (r < minDim * 0.05 || r > maxDim * 0.8) continue;
+      xs.push(cx); ys.push(cy);
+      weights.push(circles.cols - i); // 霍夫结果按置信度排序，靠前权重大
+    }
+    if (xs.length < 3) return null;
+    const weightedMedian = (vals) => {
+      const items = vals.map((v, i) => ({ v, w: weights[i] })).sort((a, b) => a.v - b.v);
+      const total = items.reduce((s, it) => s + it.w, 0);
+      let acc = 0;
+      for (const it of items) { acc += it.w; if (acc >= total / 2) return it.v; }
+      return items[items.length - 1].v;
+    };
+    return { x: weightedMedian(xs), y: weightedMedian(ys) };
+  } catch (e) {
+    return null;
+  } finally {
+    enhanced?.delete?.();
+    circles.delete();
+  }
+}
+
+// 低对比度增强: 直方图均衡 + 高斯平滑 (实拍暗场图环纹反差极弱，不增强 Hough 几乎检不出)
+// 注: 本构建无 cv.createCLAHE，equalizeHist 可用
+function enhancedMat(gray) {
+  const eq = new cv.Mat();
+  const out = new cv.Mat();
+  try {
+    cv.equalizeHist(gray, eq);
+    cv.GaussianBlur(eq, out, new cv.Size(5, 5), 0);
+    return out.clone();
+  } finally {
+    eq.delete();
+    out.delete();
+  }
+}
+
+// 模板选位: 以粗圆心为中心，在多个半径×角度候选中收集避开叉丝的高纹理方块，
+// 按纹理度降序返回多个中心间距充分分离的候选 (供多模板一致性验证)
+function pickTemplateCandidates(gray, rough, tSize, vLine, hLine, count) {
+  const rows = gray.rows, cols = gray.cols;
+  const data = gray.data;
+  const half = tSize / 2;
+  const margin = Math.round(tSize * 0.15);
+  // 候选半径: 中等环带 (避开中心过曝区与外缘)
+  const rBase = Math.min(cols, rows);
+  const radii = [0.16, 0.24, 0.32].map(f => f * rBase);
+  // 八个方位角
+  const angles = [0, 45, 90, 135, 180, 225, 270, 315].map(d => d * Math.PI / 180);
+  const cands = [];
+  for (const r of radii) {
+    for (const a of angles) {
+      const cx = rough.x + r * Math.cos(a);
+      const cy = rough.y + r * Math.sin(a);
+      const x0 = Math.round(cx - half), y0 = Math.round(cy - half);
+      const x1 = x0 + tSize, y1 = y0 + tSize;
+      if (x0 < 2 || y0 < 2 || x1 > cols - 2 || y1 > rows - 2) continue;      // 边界
+      if (rectHitsCrosshair(x0, y0, x1, y1, vLine, hLine, margin)) continue;  // 叉丝
+      // 区域纹理度 = 像素方差 (隔行采样提速)
+      let sum = 0, sumSq = 0, cnt = 0;
+      for (let y = y0; y < y1; y += 2) {
+        const off = y * cols;
+        for (let x = x0; x < x1; x += 2) {
+          const v = data[off + x];
+          sum += v; sumSq += v * v; cnt++;
+        }
+      }
+      const variance = sumSq / cnt - (sum / cnt) ** 2;
+      if (variance < 60) continue; // 纹理过弱 (大片均匀区)
+      cands.push({ x0, y0, variance });
+    }
+  }
+  cands.sort((a, b) => b.variance - a.variance);
+  const picked = [];
+  const minGap = tSize * 1.5; // 候选中心最小间距，避免多模板落在同一段环纹上失去独立性
+  for (const c of cands) {
+    if (picked.length >= count) break;
+    const ccx = c.x0 + tSize / 2, ccy = c.y0 + tSize / 2;
+    if (picked.every(p => Math.hypot(p.x0 + tSize / 2 - ccx, p.y0 + tSize / 2 - ccy) >= minGap)) picked.push(c);
+  }
+  return picked;
+}
+
+// ---------- ② 牛顿环圆心拟合配准 ----------
+// 原理: 载物台平移使整套干涉环整体移动，分别拟合两图圆环圆心，圆心差即平移量
+// 强制校验: 圆心仅由逐环采样点拟合计算，禁止使用叉丝交点 / 图像几何中心替代
+export async function estimateTranslationByRingCenters(calibImageA, calibImageB, options = {}) {
+  const opts = { ...DEFAULT_OPTIONS, ...options };
+  const imgElA = await loadImageEl(calibImageA.src);
+  const imgElB = await loadImageEl(calibImageB.src);
+  let srcA = null, srcB = null;
+  try {
+    srcA = cv.imread(imgElA);
+    srcB = cv.imread(imgElB);
+    const fitA = fitRingCenter(srcA, 'A');
+    const fitB = fitRingCenter(srcB, 'B');
+    if (!fitA.ok) return { ok: false, method: '圆心拟合', message: `图A 圆环拟合失败 (${fitA.message})` };
+    if (!fitB.ok) return { ok: false, method: '圆心拟合', message: `图B 圆环拟合失败 (${fitB.message})` };
+    const dx = fitB.cx - fitA.cx;
+    const dy = fitB.cy - fitA.cy;
+    const mag = Math.hypot(dx, dy);
+    console.log(`[自动配准] 圆心拟合: A图圆心=(${fitA.cx.toFixed(2)}, ${fitA.cy.toFixed(2)}) [${fitA.rings.length}环, 离散度${fitA.dispersion.toFixed(2)}px], ` +
+      `B图圆心=(${fitB.cx.toFixed(2)}, ${fitB.cy.toFixed(2)}) [${fitB.rings.length}环, 离散度${fitB.dispersion.toFixed(2)}px]`);
+    console.log(`[自动配准] 圆心拟合位移: Δx=${dx.toFixed(2)}, Δy=${dy.toFixed(2)}, 模长=${mag.toFixed(2)}px`);
+    // 合理性校验: 圆环数不足/圆心离散度过大 → 低质回退；位移近零 → 不采信
+    if (Math.min(fitA.rings.length, fitB.rings.length) < opts.minRings ||
+      Math.max(fitA.dispersion, fitB.dispersion) > opts.maxDispersion) {
+      return { ok: false, method: '圆心拟合', message: `圆环拟合质量不足 (环数 ${fitA.rings.length}/${fitB.rings.length}, 离散度 ${fitA.dispersion.toFixed(2)}/${fitB.dispersion.toFixed(2)}px)` };
+    }
+    if (mag < opts.zeroShiftThreshold) {
+      return { ok: false, method: '圆心拟合', message: `圆心位移≈0 (${mag.toFixed(2)}px)，不采信` };
+    }
+    const lowConfidence = fitA.rings.length < opts.minRings + 2 || fitB.rings.length < opts.minRings + 2 ||
+      Math.max(fitA.dispersion, fitB.dispersion) > opts.lowDispersion;
+    return {
+      ok: true,
+      method: '圆心拟合',
+      dx, dy,
+      lowConfidence,
+      detail: `环数 ${fitA.rings.length}/${fitB.rings.length}, 离散度 ${fitA.dispersion.toFixed(2)}/${fitB.dispersion.toFixed(2)}px`,
+      centerA: { x: fitA.cx, y: fitA.cy },
+      centerB: { x: fitB.cx, y: fitB.cy },
+      ringsA: fitA.rings.length,
+      ringsB: fitB.rings.length,
+      pointA: { x: Math.round(fitA.cx), y: Math.round(fitA.cy) },
+      pointB: { x: Math.round(fitB.cx), y: Math.round(fitB.cy) }
+    };
+  } catch (e) {
+    return { ok: false, method: '圆心拟合', message: e.message || '圆心拟合异常' };
+  } finally {
+    srcA?.delete?.();
+    srcB?.delete?.();
+  }
+}
+
+// 单图圆环圆心拟合: 预处理去叉丝 → 霍夫多环检测 → 逐环径向对称精修 → 中值合成圆心
+// 圆心完全由圆环采样点计算得出，绝不回退到叉丝交点或图像几何中心
+function fitRingCenter(src, label) {
+  let gray = null, denoised = null, wireMask = null, clean = null, enhanced = null;
+  try {
+    gray = new cv.Mat();
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    denoised = new cv.Mat();
+    cv.medianBlur(gray, denoised, 3);
+    // 叉丝检测与修复 (inpaint 平滑去除叉丝线条，避免其边缘干扰圆拟合)
+    const { vLine, hLine } = detectCrosshair(denoised);
+    clean = new cv.Mat();
+    if (vLine || hLine) {
+      wireMask = new cv.Mat(denoised.rows, denoised.cols, cv.CV_8UC1, new cv.Scalar(0));
+      const white = new cv.Scalar(255, 255, 255, 255);
+      if (vLine) cv.rectangle(wireMask, new cv.Point(vLine.pos - vLine.half, 0), new cv.Point(vLine.pos + vLine.half, denoised.rows - 1), white, -1);
+      if (hLine) cv.rectangle(wireMask, new cv.Point(0, hLine.pos - hLine.half), new cv.Point(denoised.cols - 1, hLine.pos + hLine.half), white, -1);
+      cv.inpaint(denoised, wireMask, clean, 3, cv.INPAINT_TELEA);
+      console.log(`[圆心拟合] 图${label} 叉丝已屏蔽修复:`, vLine ? `竖线 x=${vLine.pos}` : '', hLine ? `横线 y=${hLine.pos}` : '');
+    } else {
+      denoised.copyTo(clean);
+    }
+    // 实拍暗场低对比度增强: 直方图均衡后再检圆 (原参数在原图实测检出 0；均衡后可检出上百候选)
+    enhanced = enhancedMat(clean);
+    // 霍夫圆检测多个同心环 (参数经实拍标定；最大半径需覆盖真实外环，避免检出巨型伪圆)
+    const minDim = Math.min(denoised.cols, denoised.rows);
+    const circles = new cv.Mat();
+    cv.HoughCircles(
+      enhanced, circles, cv.HOUGH_GRADIENT,
+      1, minDim * 0.04,   // dp, minDist (同心环间距小，需密集检测)
+      60, 15,             // param1(Canny), param2(累加器阈值，暗场需放松)
+      Math.round(minDim * 0.04), Math.round(minDim * 0.45)
+    );
+    const raw = [];
+    for (let i = 0; i < circles.cols; i++) {
+      raw.push({ cx: circles.data32F[i * 3], cy: circles.data32F[i * 3 + 1], r: circles.data32F[i * 3 + 2] });
+    }
+    circles.delete();
+    if (raw.length === 0) return { ok: false, message: '霍夫圆未检测到圆环' };
+    // 半径聚类去重: 半径相近的候选归并为同一环 (Hough 对同一环常返回多个近似结果)
+    raw.sort((a, b) => a.r - b.r);
+    const groups = [];
+    for (const c of raw) {
+      const last = groups[groups.length - 1];
+      if (last && Math.abs(c.r - last.r) < Math.max(4, last.r * 0.04)) continue;
+      groups.push({ ...c });
+    }
+    // 放松阈值后候选数大增 (实拍上百个)，按 Hough 置信序截取前 24 组控制逐环精修开销
+    if (groups.length > 24) groups.length = 24;
+    // 逐环径向对称性精修圆心 (圆周亮度标准差最小化，跳过叉丝带)
+    const wireFree = (x, y) => {
+      if (vLine && Math.abs(x - vLine.pos) <= vLine.half) return false;
+      if (hLine && Math.abs(y - hLine.pos) <= hLine.half) return false;
+      return true;
+    };
+    // 粗圆心候选: 全部原始候选中值 + 高置信前若干中值 (暗场伪圆多，单一中值可能有偏)，
+    // 粗圆心仅为精修初值，最终圆心完全由逐环圆周采样点拟合得出 (多假设宽窗口择优)
+    const rawSorted = [...raw]; // raw 已按 Hough 置信序
+    const topN = rawSorted.slice(0, Math.min(20, rawSorted.length));
+    const hypotheses = [
+      { x: median(raw.map(g => g.cx)), y: median(raw.map(g => g.cy)), range: 16, step: 2, tag: '全体中值' },
+      { x: median(topN.map(g => g.cx)), y: median(topN.map(g => g.cy)), range: 48, step: 4, tag: '高置信中值' }
+    ];
+    let rings2 = [];
+    let usedHyp = hypotheses[0];
+    let bestKey = null; // 择优键: 离散度最小，次选支撑环数最多 (支撑数不能单独作正确性判据)
+    for (const hyp of hypotheses) {
+      // 首轮粗精修 (宽窗口) → 中值更新 → 窄窗口二轮收敛 (实拍位移可达几十像素)
+      const rings = [];
+      for (const g of groups) {
+        const ref = refineRingCenter(enhanced, hyp.x, hyp.y, g.r, wireFree, hyp.range, hyp.step);
+        if (ref) rings.push({ ...ref, r: g.r });
+      }
+      if (rings.length < 2) continue;
+      const cx1 = median(rings.map(p => p.cx));
+      const cy1 = median(rings.map(p => p.cy));
+      const r2 = [];
+      for (const g of groups) {
+        const ref = refineRingCenter(enhanced, cx1, cy1, g.r, wireFree, 8);
+        if (ref) r2.push({ ...ref, r: g.r });
+      }
+      if (r2.length < 2) continue;
+      const cx2 = median(r2.map(p => p.cx));
+      const cy2 = median(r2.map(p => p.cy));
+      const sup = r2.filter(p => Math.hypot(p.cx - cx2, p.cy - cy2) <= DEFAULT_OPTIONS.maxDispersion);
+      if (sup.length < 2) continue;
+      const disp = Math.max(...sup.map(p => Math.hypot(p.cx - cx2, p.cy - cy2)));
+      const key = { disp, support: sup.length };
+      if (!bestKey || key.disp < bestKey.disp - 0.5 || (Math.abs(key.disp - bestKey.disp) <= 0.5 && key.support > bestKey.support)) {
+        bestKey = key;
+        rings2 = r2;
+        usedHyp = hyp;
+      }
+    }
+    if (rings2.length < 2) return { ok: false, message: `精修后可用圆环不足 (${rings2.length})` };
+    const coarseX = usedHyp.x, coarseY = usedHyp.y;
+    let cx = median(rings2.map(p => p.cx));
+    let cy = median(rings2.map(p => p.cy));
+    // 第三轮像素级收敛: 步长1窄窗口，消除步长2的量化误差 (标定精度需求)
+    const rings3 = [];
+    for (const p of rings2) {
+      const ref = refineRingCenter(enhanced, p.cx, p.cy, p.r, wireFree, 3, 1);
+      if (ref) rings3.push({ ...ref, r: p.r });
+    }
+    if (rings3.length >= 2) {
+      cx = median(rings3.map(p => p.cx));
+      cy = median(rings3.map(p => p.cy));
+      rings2.length = 0;
+      rings2.push(...rings3);
+    }
+    // 剔除离群环 (环系外的伪圆精修后偏离合成圆心)，离散度仅由支撑环评估 (中值圆心不受离群影响)
+    const supported = rings2.filter(p => Math.hypot(p.cx - cx, p.cy - cy) <= DEFAULT_OPTIONS.maxDispersion);
+    if (supported.length < 2) return { ok: false, message: `支撑圆环不足 (${supported.length})` };
+    const dispersion = Math.max(...supported.map(p => Math.hypot(p.cx - cx, p.cy - cy)));
+    console.log(`[圆心拟合] 图${label} 粗圆心假设=${usedHyp.tag}(${coarseX.toFixed(1)}, ${coarseY.toFixed(1)}), 支撑环 ${supported.length}/${rings2.length} 个, 离散度 ${dispersion.toFixed(2)}px: ` +
+      supported.map(p => `r=${p.r.toFixed(0)}@(${p.cx.toFixed(1)},${p.cy.toFixed(1)})`).join(' | '));
+    // 强制校验: 圆心必须落在圆环采样数据的支撑范围内 (距逐环圆心最远不超过离散度上限)，
+    // 否则说明合成结果并非来自圆环采样 (如退化为几何中心)，判失效交后续算法
+    if (dispersion > DEFAULT_OPTIONS.maxDispersion * 2) {
+      return { ok: false, message: `圆心离散度过大 (${dispersion.toFixed(1)}px)，采样点不支撑该圆心` };
+    }
+    return { ok: true, cx, cy, rings: supported, dispersion };
+  } finally {
+    gray?.delete?.();
+    denoised?.delete?.();
+    wireMask?.delete?.();
+    clean?.delete?.();
+    enhanced?.delete?.();
+  }
+}
+
+// 单环圆心精修: 径向剖面匹配。沿 48 条辐条取径向亮度剖面，环向平均后评估剖面中环带的振幅。
+// 圆心正确时所有辐条的环带落在同一径向位置，平均剖面锐利、振幅大；圆心偏移时各辐条环带径向位置不一，
+// 平均被抹平、振幅骤降。假半径 (环间空隙) 在任何圆心处剖面都无环带，振幅恒低，被自然排除。
+// 注: 不可用"径向 ±2 取梯度极大值"类判据——环间距小时会搭上相邻环，得分面平坦无法定位圆心。
+// 最优格点邻域 3 点抛物线亚像素精修: 消除步长量化误差，返回浮点圆心 (标定精度需求)
+function refineRingCenter(gray, cx0, cy0, r, wireFree, range = 8, step = 2) {
+  const rows = gray.rows, cols = gray.cols;
+  const spokes = 48, span = 8;
+  const cosT = [], sinT = [];
+  for (let i = 0; i < spokes; i++) {
+    const ang = (i * 2 * Math.PI) / spokes;
+    cosT.push(Math.cos(ang)); sinT.push(Math.sin(ang));
+  }
+  // 记录最优格点 ±1 邻域振幅 (相对坐标索引 (dx+1)*3+(dy+1))，供抛物线精修；网格不覆盖处保持 null 则不精修
+  const localAmp = new Array(9).fill(null);
+  let bestX = cx0, bestY = cy0, bestAmp = -1;
+  for (let oy = -range; oy <= range; oy += step) {
+    for (let ox = -range; ox <= range; ox += step) {
+      const tx = cx0 + ox, ty = cy0 + oy;
+      const prof = new Float64Array(2 * span + 1);
+      let profCnt = 0;
+      for (let i = 0; i < spokes; i++) {
+        let ok = true;
+        const line = new Float64Array(2 * span + 1);
+        for (let s = -span; s <= span; s++) {
+          const rr = r + s;
+          const x = Math.round(tx + rr * cosT[i]), y = Math.round(ty + rr * sinT[i]);
+          if (x < 0 || x >= cols || y < 0 || y >= rows || !wireFree(x, y)) { ok = false; break; }
+          line[s + span] = gray.ucharAt(y, x);
+        }
+        if (!ok) continue;
+        for (let s = 0; s <= 2 * span; s++) prof[s] += line[s];
+        profCnt++;
+      }
+      if (profCnt < spokes * 0.6) continue; // 可用辐条过少 (靠近边界/叉丝) 则放弃该候选
+      // 振幅 = 环带均值与两侧邻带均值之差的较大者 (环可暗可亮)
+      let bandSum = 0, innerSum = 0, outerSum = 0;
+      for (let s = -span; s <= span; s++) {
+        if (s >= -2 && s <= 2) bandSum += prof[s + span];
+        else if (s < -2) innerSum += prof[s + span];
+        else outerSum += prof[s + span];
+      }
+      const band = bandSum / 5, inner = innerSum / (span - 2), outer = outerSum / (span - 2);
+      const amp = Math.max(Math.abs(band - inner), Math.abs(band - outer));
+      if (amp > bestAmp) { bestAmp = amp; bestX = tx; bestY = ty; }
+      if (bestX - tx >= -1 && bestX - tx <= 1 && bestY - ty >= -1 && bestY - ty <= 1) {
+        localAmp[(bestX - tx + 1) * 3 + (bestY - ty + 1)] = amp;
+      }
+    }
+  }
+  // 振幅不足说明该候选半径并非真实干涉环 (剖面无环带结构)，丢弃
+  if (bestAmp < 15) return null;
+  // 邻域振幅齐全且峰形非平坦时抛物线亚像素精修 (分母为峰值曲率，平坦/噪声面不精修)
+  if (localAmp.every(v => v !== null)) {
+    const A = (i, j) => localAmp[(i + 1) * 3 + (j + 1)];
+    const denX = A(-1, 0) - 2 * A(0, 0) + A(1, 0);
+    const denY = A(0, -1) - 2 * A(0, 0) + A(0, 1);
+    const fx = denX <= -1e-6 ? (A(-1, 0) - A(1, 0)) / (2 * denX) : 0;
+    const fy = denY <= -1e-6 ? (A(0, -1) - A(0, 1)) / (2 * denY) : 0;
+    if (Math.abs(fx) <= 0.5 && Math.abs(fy) <= 0.5) return { cx: bestX + fx, cy: bestY + fy };
+  }
+  return { cx: bestX, cy: bestY };
+}
+
+// ---------- ③ ORB + 平移RANSAC 配准 ----------
+// options.onProgress?.({ stage, kpA, kpB, matched, inliers }) 分阶段回报进度；
+// 大图先缩小提点匹配 (坐标自动换算回原图)，各阶段间让出主线程，避免页面失去响应
+const yieldToUI = () => new Promise(r => setTimeout(r, 0));
+
+export async function estimateTranslationORB(calibImageA, calibImageB, options = {}) {
+  const opts = { ...DEFAULT_OPTIONS, ...options };
+  const imgElA = await loadImageEl(calibImageA.src);
+  const imgElB = await loadImageEl(calibImageB.src);
+  let grayA = toDenoisedGray(imgElA, opts.blurSize);
+  let grayB = toDenoisedGray(imgElB, opts.blurSize);
+  await yieldToUI();
+  // 大图先缩小再提点/匹配 (暴力匹配成本随点数平方增长)，结果坐标按 1/scale 换算回原图尺寸 (两图同机位同比例)
+  let scale = 1;
+  const maxDim = Math.max(grayA.cols, grayA.rows);
+  if (opts.maxMatchDim > 0 && maxDim > opts.maxMatchDim) {
+    scale = opts.maxMatchDim / maxDim;
+    const smallA = new cv.Mat(), smallB = new cv.Mat();
+    cv.resize(grayA, smallA, new cv.Size(), scale, scale, cv.INTER_AREA);
+    cv.resize(grayB, smallB, new cv.Size(), scale, scale, cv.INTER_AREA);
+    grayA.delete();
+    grayB.delete();
+    grayA = smallA;
+    grayB = smallB;
+    console.log(`[自动配准] 大图缩小 ×${scale.toFixed(3)} 后提点匹配 (${grayA.cols}x${grayA.rows})`);
+  }
+  const inv = 1 / scale;
+  // 环纹盘屏蔽中心应对准真实环系 (实拍环系常偏离图像几何中心，否则盘外鼓轮刻度等固定前景会被提点)
+  const roughA = roughRingCenter(grayA);
+  const maskA = buildFeatureMask(grayA, opts, roughA);
+  const maskB = buildFeatureMask(grayB, opts, roughA);
+  const kpA = new cv.KeyPointVector();
+  const kpB = new cv.KeyPointVector();
+  const desA = new cv.Mat();
+  const desB = new cv.Mat();
+  const matches = new cv.DMatchVector();
+  let orb = null, matcher = null;
+  let orbFailMsg = '';
+  let inlierCount = 0;
+  let matchPairs = [];
+  try {
+    orb = new cv.ORB(opts.maxFeatures, 1.2, 8);
+    orb.detectAndCompute(grayA, maskA, kpA, desA);
+    orb.detectAndCompute(grayB, maskB, kpB, desB);
+    opts.onProgress?.({ stage: 'detect', kpA: kpA.size(), kpB: kpB.size() });
+    await yieldToUI();
+    if (desA.rows < 2 || desB.rows < 2) {
+      orbFailMsg = 'ORB 特征点数量不足';
+    } else {
+      matcher = new cv.BFMatcher(cv.NORM_HAMMING, true); // crossCheck 抑制周期纹理歧义 (成本 O(N×M)，已靠缩图/限点数控制)
+      matcher.match(desA, desB, matches);
+      const filtered = [];
+      for (let i = 0; i < matches.size(); i++) {
+        if (matches.get(i).distance <= opts.maxMatchDistance) filtered.push(matches.get(i));
+      }
+      console.log(`[自动配准] ORB 原始匹配数: ${matches.size()}, 距离过滤后 (≤${opts.maxMatchDistance}): ${filtered.length}`);
+      opts.onProgress?.({ stage: 'match', kpA: kpA.size(), kpB: kpB.size(), matched: filtered.length });
+      await yieldToUI();
+      if (filtered.length < 2) {
+        orbFailMsg = 'ORB 特征匹配数量不足';
+      } else {
+        const pairs = [];
+        for (const m of filtered) {
+          // 注: opencv.js KeyPoint 坐标位于 .pt 属性 (p.x 为 undefined)
+          const pa = kpA.get(m.queryIdx).pt;
+          const pb = kpB.get(m.trainIdx).pt;
+          pairs.push({ ax: pa.x, ay: pa.y, bx: pb.x, by: pb.y });
+        }
+        // 匹配对过多时抽样跑 RANSAC (避免长尾)，再用求得的平移量回扫全部匹配对，内点数量不受损
+        let sample = pairs;
+        if (sample.length > opts.ransacSampleCap) {
+          const stride = Math.ceil(sample.length / opts.ransacSampleCap);
+          sample = sample.filter((_, i) => i % stride === 0);
+          console.log(`[自动配准] RANSAC 抽样: ${pairs.length} → ${sample.length} 对`);
+        }
+        const { inliers: sampleInliers, tx, ty } = ransacTranslation(sample, opts.ransacIters, opts.inlierThreshold);
+        const inliers = (tx == null)
+          ? sampleInliers
+          : pairs.filter(q => Math.abs((q.bx - q.ax) - tx) <= opts.inlierThreshold && Math.abs((q.by - q.ay) - ty) <= opts.inlierThreshold);
+        inlierCount = inliers.length;
+        // 坐标换算回原图尺寸 (缩图提点时)
+        matchPairs = inv === 1 ? inliers : inliers.map(p => ({ ax: p.ax * inv, ay: p.ay * inv, bx: p.bx * inv, by: p.by * inv }));
+        console.log(`[自动配准] RANSAC 内点数量: ${inlierCount} (阈值 ≥ ${opts.minInliers})`);
+        opts.onProgress?.({ stage: 'ransac', kpA: kpA.size(), kpB: kpB.size(), matched: filtered.length, inliers: inlierCount });
+        if (inliers.length >= opts.minInliers) {
+          let dx = median(inliers.map(p => p.bx - p.ax)) * inv;
+          let dy = median(inliers.map(p => p.by - p.ay)) * inv;
+          // 注: 近零检查必须在换算回原图尺度后进行 (缩图坐标系位移同比例缩小，否则误杀)
+          const mag = Math.hypot(dx, dy);
+          if (mag < opts.zeroShiftThreshold) {
+            orbFailMsg = `ORB 合成位移≈0 (${mag.toFixed(2)}px)，疑似叉丝残留或伪匹配`;
+          } else {
+            let best = matchPairs[0], bestErr = Infinity;
+            for (const p of matchPairs) {
+              const err = Math.abs((p.bx - p.ax) - dx) + Math.abs((p.by - p.ay) - dy);
+              if (err < bestErr) { bestErr = err; best = p; }
+            }
+            return {
+              ok: true,
+              method: 'ORB+RANSAC',
+              lowConfidence: false,
+              dx, dy,
+              inlierCount,
+              matchPairs,
+              kpA: kpA.size(), kpB: kpB.size(), matched: filtered.length,
+              detail: `内点 ${inlierCount} 对`,
+              pointA: { x: Math.round(best.ax), y: Math.round(best.ay) },
+              pointB: { x: Math.round(best.bx), y: Math.round(best.by) }
+            };
+          }
+        } else {
+          orbFailMsg = `ORB+RANSAC 内点不足 (${inliers.length} < ${opts.minInliers})`;
+        }
+      }
+    }
+    // ===== ④ 相位相关备用配准 =====
+    console.log(`[自动配准] ${orbFailMsg}，尝试相位相关法 (基于 cv.dft) 备用配准...`);
+    const phase = phaseCorrelateFallback(grayA, grayB, opts);
+    if (phase.ok) return phase;
+    console.warn(`[自动配准] 相位相关法同样不可靠: ${phase.message}`);
+    return {
+      ok: false,
+      method: 'ORB+RANSAC',
+      inlierCount,
+      matchPairs,
+      message: `${orbFailMsg}；相位相关备用配准也不可靠 (${phase.message})`
+    };
+  } finally {
+    grayA.delete();
+    grayB.delete();
+    maskA.delete();
+    maskB.delete();
+    kpA.delete();
+    kpB.delete();
+    desA.delete();
+    desB.delete();
+    matches.delete();
+    orb?.delete?.();
+    matcher?.delete?.();
+  }
+}
+
+function toDenoisedGray(imgEl, blurSize) {
+  const src = cv.imread(imgEl);
+  const gray = new cv.Mat();
+  const blurred = new cv.Mat();
+  try {
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    cv.GaussianBlur(gray, blurred, new cv.Size(blurSize, blurSize), 0);
+    const out = blurred.clone();
+    return out;
+  } finally {
+    src.delete();
+    gray.delete();
+    blurred.delete();
+  }
+}
+
+// ORB 特征掩码: 中央环纹盘屏蔽+稀疏孔降密度 (优先边缘独特特征)，叉丝带最后覆盖绝对禁止提点
+// diskCenter 为环系粗圆心 (实拍环系常偏离图像中心；失败时回退图像几何中心)
+function buildFeatureMask(gray, opts, diskCenter) {
+  const rows = gray.rows, cols = gray.cols;
+  const { vLine, hLine } = detectCrosshair(gray);
+  const mask = new cv.Mat(rows, cols, cv.CV_8UC1, new cv.Scalar(255));
+  const black = new cv.Scalar(0, 0, 0, 255);
+  const minDim = Math.min(cols, rows);
+  const cx = diskCenter ? Math.round(diskCenter.x) : Math.round(cols / 2);
+  const cy = diskCenter ? Math.round(diskCenter.y) : Math.round(rows / 2);
+  const diskR = Math.round(minDim * opts.centralMaskRatio);
+  cv.circle(mask, new cv.Point(cx, cy), diskR, black, -1);
+  const hole = Math.max(3, Math.round(minDim * opts.sparseHoleRatio));
+  const pitch = hole * 4;
+  const maskData = mask.data;
+  let holeCount = 0;
+  for (let gy = cy - diskR; gy < cy + diskR; gy += pitch) {
+    for (let gx = cx - diskR; gx < cx + diskR; gx += pitch) {
+      const ddx = gx - cx, ddy = gy - cy;
+      if (ddx * ddx + ddy * ddy > diskR * diskR) continue;
+      for (let y = Math.max(0, gy); y < gy + hole && y < rows; y++) {
+        const off = y * cols;
+        for (let x = Math.max(0, gx); x < gx + hole && x < cols; x++) maskData[off + x] = 255;
+      }
+      holeCount++;
+    }
+  }
+  const m = opts.crosshairMargin; // 叉丝带外扩，彻底剔除叉丝特征
+  if (vLine) cv.rectangle(mask, new cv.Point(vLine.pos - vLine.half - m, 0), new cv.Point(vLine.pos + vLine.half + m, rows - 1), black, -1);
+  if (hLine) cv.rectangle(mask, new cv.Point(0, hLine.pos - hLine.half - m), new cv.Point(cols - 1, hLine.pos + hLine.half + m), black, -1);
+  console.log(`[自动配准] 特征掩码: 环纹盘 r=${diskR} (孔${holeCount}个), ` +
+    `${vLine ? `竖叉丝 x=${vLine.pos}±${vLine.half + m}` : '无竖叉丝'}, ${hLine ? `横叉丝 y=${hLine.pos}±${hLine.half + m}` : '无横叉丝'}`);
+  return mask;
+}
+
+// 平移模型 RANSAC (返回最优内点集与对应平移量，供抽样后用全量匹配对回扫内点)
+function ransacTranslation(pairs, iters, tol) {
+  const n = pairs.length;
+  let bestInliers = [];
+  let bestTx = null, bestTy = null;
+  for (let it = 0; it < iters; it++) {
+    const p = pairs[Math.floor(Math.random() * n)];
+    const tx = p.bx - p.ax, ty = p.by - p.ay;
+    const inliers = [];
+    for (const q of pairs) {
+      if (Math.abs((q.bx - q.ax) - tx) <= tol && Math.abs((q.by - q.ay) - ty) <= tol) inliers.push(q);
+    }
+    if (inliers.length > bestInliers.length) {
+      bestInliers = inliers;
+      bestTx = tx;
+      bestTy = ty;
+      if (bestInliers.length >= n * 0.75) break; // 提前收敛
+    }
+  }
+  return { inliers: bestInliers, tx: bestTx, ty: bestTy };
+}
+
+// ---------- ④ 相位相关备用配准 (cv.dft 手动实现) ----------
+// 注: 当前 opencv.js 构建无 cv.phaseCorrelate；互功率谱逆变换峰位于 (-Δx,-Δy)，需取反。
+// 掩码仅屏蔽叉丝带 (固定前景两图一致，会制造原点伪峰)；干涉环保持完整，它们是位移主信号
+function phaseCorrelateFallback(grayA, grayB, opts) {
+  if (grayA.rows !== grayB.rows || grayA.cols !== grayB.cols) {
+    return { ok: false, message: '两图尺寸不一致' };
+  }
+  const rows = grayA.rows, cols = grayA.cols;
+  const f32A = new cv.Mat(), f32B = new cv.Mat(), mA = new cv.Mat(), mB = new cv.Mat();
+  const F1 = new cv.Mat(), F2 = new cv.Mat(), cross = new cv.Mat(), corr = new cv.Mat();
+  const phaseMask = new cv.Mat(rows, cols, cv.CV_8UC1, new cv.Scalar(255));
+  try {
+    const { vLine, hLine } = detectCrosshair(grayA);
+    const black = new cv.Scalar(0, 0, 0, 255);
+    const pm = 8; // 叉丝带外扩屏蔽宽度
+    if (vLine) cv.rectangle(phaseMask, new cv.Point(vLine.pos - vLine.half - pm, 0), new cv.Point(vLine.pos + vLine.half + pm, rows - 1), black, -1);
+    if (hLine) cv.rectangle(phaseMask, new cv.Point(0, hLine.pos - hLine.half - pm), new cv.Point(cols - 1, hLine.pos + hLine.half + pm), black, -1);
+    grayA.convertTo(f32A, cv.CV_32F);
+    grayB.convertTo(f32B, cv.CV_32F);
+    f32A.copyTo(mA, phaseMask);
+    f32B.copyTo(mB, phaseMask);
+    cv.dft(mA, F1, cv.DFT_COMPLEX_OUTPUT);
+    cv.dft(mB, F2, cv.DFT_COMPLEX_OUTPUT);
+    cross.create(rows, cols, cv.CV_32FC2);
+    const d1 = F1.data32F, d2 = F2.data32F, dc = cross.data32F;
+    const total = rows * cols;
+    for (let i = 0; i < total; i++) {
+      const ar = d1[2 * i], ai = d1[2 * i + 1];
+      const br = d2[2 * i], bi = d2[2 * i + 1];
+      const re = ar * br + ai * bi;
+      const im = ai * br - ar * bi;
+      const mag = Math.sqrt(re * re + im * im) || 1e-8;
+      dc[2 * i] = re / mag;
+      dc[2 * i + 1] = im / mag;
+    }
+    cv.dft(cross, corr, cv.DFT_INVERSE | cv.DFT_SCALE | cv.DFT_COMPLEX_OUTPUT);
+    const cr = corr.data32F;
+    let peak = -Infinity, px = 0, py = 0;
+    for (let y = 0; y < rows; y++) {
+      const off = y * cols * 2;
+      for (let x = 0; x < cols; x++) {
+        const v = cr[off + 2 * x];
+        if (v > peak) { peak = v; py = y; px = x; }
+      }
+    }
+    // 亚像素精修: 峰位非边界时用相邻 3 点抛物线拟合 (提升暗场低峰宽相关面的定位精度)
+    if (px > 0 && py > 0 && px < cols - 1 && py < rows - 1) {
+      const atC = (x, y) => cr[y * cols * 2 + 2 * x];
+      const vc = atC(px, py);
+      const fx = (atC(px - 1, py) - atC(px + 1, py)) / (2 * (atC(px - 1, py) - 2 * vc + atC(px + 1, py)));
+      const fy = (atC(px, py - 1) - atC(px, py + 1)) / (2 * (atC(px, py - 1) - 2 * vc + atC(px, py + 1)));
+      if (isFinite(fx) && isFinite(fy) && Math.abs(fx) <= 1 && Math.abs(fy) <= 1) { px += fx; py += fy; }
+    }
+    let dx = -(px > cols / 2 ? px - cols : px);
+    let dy = -(py > rows / 2 ? py - rows : py);
+    console.log(`[自动配准] 相位相关结果: Δx=${dx.toFixed(2)}, Δy=${dy.toFixed(2)}, 相关峰=${peak.toFixed(3)} (丢弃阈值 ${opts.peakReject}, 低置信阈值 ${opts.peakWarn})`);
+    if (peak < opts.peakReject) {
+      return { ok: false, message: `相关峰过低 (${peak.toFixed(3)} < ${opts.peakReject})` };
+    }
+    if (!isFinite(dx) || !isFinite(dy) || Math.abs(dx) > cols * 0.6 || Math.abs(dy) > rows * 0.6) {
+      return { ok: false, message: '位移量超出合理范围' };
+    }
+    if (Math.hypot(dx, dy) < opts.zeroShiftThreshold) {
+      // 防伪零峰: 主峰位于原点时，在环回原点邻域外搜索最佳次峰；次峰够强则采信，否则判伪匹配
+      let peak2 = -Infinity, px2 = 0, py2 = 0;
+      for (let y = 0; y < rows; y++) {
+        const off = y * cols * 2;
+        for (let x = 0; x < cols; x++) {
+          const wx = Math.min(x, cols - x), wy = Math.min(y, rows - y);
+          if (Math.hypot(wx, wy) < 10) continue;
+          const v = cr[off + 2 * x];
+          if (v > peak2) { peak2 = v; px2 = x; py2 = y; }
+        }
+      }
+      if (peak2 >= peak * opts.secondaryPeakRatio) {
+        console.log(`[自动配准] 相位相关防零峰: 原点主峰=${peak.toFixed(3)}，采信次峰=${peak2.toFixed(3)} @(${px2},${py2})`);
+        peak = peak2; px = px2; py = py2;
+        dx = -(px > cols / 2 ? px - cols : px);
+        dy = -(py > rows / 2 ? py - rows : py);
+      } else {
+        return { ok: false, message: `相位相关主峰位于原点属伪匹配 (次峰 ${peak2.toFixed(3)} 过弱，主峰 ${peak.toFixed(3)})` };
+      }
+    }
+    const x0 = Math.max(0, dx), x1 = Math.min(cols, cols + dx);
+    const y0 = Math.max(0, dy), y1 = Math.min(rows, rows + dy);
+    const ax = Math.round((x0 + x1) / 2);
+    const ay = Math.round((y0 + y1) / 2);
+    return {
+      ok: true,
+      method: '相位相关',
+      lowConfidence: peak < opts.peakWarn,
+      detail: `相关峰 ${peak.toFixed(3)}`,
+      dx, dy,
+      inlierCount: 0,
+      matchPairs: [],
+      pointA: { x: ax, y: ay },
+      pointB: { x: ax + Math.round(dx), y: ay + Math.round(dy) }
+    };
+  } catch (e) {
+    return { ok: false, message: e.message || '相位相关计算异常' };
+  } finally {
+    f32A.delete(); f32B.delete(); mA.delete(); mB.delete();
+    F1.delete(); F2.delete(); cross.delete(); corr.delete();
+    phaseMask.delete();
+  }
+}
+
+// ---------- ⑤ 人工粗对齐后的局部精细微调 ----------
+// 场景: 用户已将图B半透明叠加在图A上并通过滑块/方向键粗对齐 (绘制偏移 tx, ty:
+// 图B像素 b 显示在 b + (tx, ty) 处)，本函数仅在当前偏移 ±searchRange 内搜索更优平移，
+// 使两套圆环贴合得更好；十字叉丝位于两图相同位置属固定前景，全程排除不参与计算。
+// 多模板在各自局部窗口独立匹配 + 修正量一致性验证；结果不可靠时返回 ok=false (上层保持位置不变并提示)
+// 返回值的 dx, dy 为建议的新绘制偏移 (与传入的 tx, ty 同口径)
+export async function refineTranslationNear(calibImageA, calibImageB, tx, ty, options = {}) {
+  const opts = {
+    searchRange: 24,           // 单轮各方向搜索半径 (px)
+    maxTotalShift: 36,         // 累计修正量上限 (px): 环纹自相似，超出后相邻环伪峰风险剧增，不再扩大搜索 (需求: 只在很小范围内微调)
+    templateSizeRatio: 0.18,
+    templateCount: 3,
+    scoreMin: 0.65,            // 单模板 NCC 得分下限 (粗对齐后重合区得分应明显高于此)
+    consistencyThreshold: 2.0, // 多模板修正量最大允许差 (px)
+    ...options
+  };
+  const imgElA = await loadImageEl(calibImageA.src);
+  const imgElB = await loadImageEl(calibImageB.src);
+  let grayA = null, grayB = null;
+  const mats = [];
+  try {
+    grayA = toGrayMat(imgElA);
+    grayB = toGrayMat(imgElB);
+    if (grayA.rows !== grayB.rows || grayA.cols !== grayB.cols) {
+      return { ok: false, message: '两图尺寸不一致' };
+    }
+    const rows = grayA.rows, cols = grayA.cols;
+    const R = Math.max(8, Math.round(opts.searchRange));
+    const { vLine, hLine } = detectCrosshair(grayA);
+    const rough = roughRingCenter(grayA) || { x: cols / 2, y: rows / 2 };
+    const tSize = Math.max(48, Math.min(220, Math.round(Math.min(cols, rows) * opts.templateSizeRatio)));
+    const candidates = pickFineTemplates(grayA, rough, tSize, vLine, hLine, R, opts.templateCount);
+    console.log(`[精细对齐] ${candidates.length} 个模板候选, 边长=${tSize}, 搜索半径=±${R}px, 累计上限=${opts.maxTotalShift}px [叉丝: ${vLine ? '竖x=' + vLine.pos : '无'} ${hLine ? '横y=' + hLine.pos : '无'}]`);
+    if (!candidates.length) return { ok: false, message: '未找到避开叉丝的合适模板区域，无法精细对齐' };
+    // 小范围迭代收敛 (最多两轮，累计修正受 maxTotalShift 封顶):
+    // 第一轮峰未触边界 → 直接采信；峰触边界且多模板方向一致 → 按封顶额度续搜一轮，
+    // 避免粗对齐偏差略大于单轮半径时直接拒绝；环纹自相似伪峰在较大偏移处不可区分，故不无限扩大搜索范围。
+    const searchOnce = (curTx, curTy) => {
+      const list = [];
+      for (const sel of candidates) {
+        const r = matchTemplateNear(grayA, grayB, sel, tSize, curTx, curTy, R, vLine, hLine, mats);
+        if (r) list.push(r);
+      }
+      return list;
+    };
+    const spreadOf = (list) => {
+      let spread = 0;
+      for (let i = 0; i < list.length; i++) {
+        for (let j = i + 1; j < list.length; j++) {
+          spread = Math.max(spread, Math.hypot(list[i].dx - list[j].dx, list[i].dy - list[j].dy));
+        }
+      }
+      return spread;
+    };
+    let results = searchOnce(tx, ty);
+    if (!results.length) return { ok: false, message: '搜索窗口越出图B边界，请先将圆环粗对齐到更靠近的位置' };
+    let usable = results.filter(r => r.score >= opts.scoreMin && !r.saturated);
+    let roundsUsed = 1;
+    if (!usable.length && results.every(r => r.saturated)) {
+      // 全部模板峰值触及边界且方向一致 → 还有继续搜索的空间，在累计上限内续搜一轮 (等效扩大搜索半径)
+      // 注: 饱和分量已丢失幅度信息 (仅知 ≥R)，方向一致性容差放宽；方向矛盾的伪峰差值达数十像素，仍会被严阈值过滤
+      const satTol = opts.consistencyThreshold * 3;
+      if (results.length >= 2 && spreadOf(results) > satTol) {
+        return { ok: false, message: `多模板微调修正量不一致 (最大差 ${spreadOf(results).toFixed(1)}px > ${satTol}px)，环纹自相似歧义不可靠` };
+      }
+      let mx = median(results.map(r => r.dx)), my = median(results.map(r => r.dy));   // 饱和峰的中值修正 (方向可信，幅度取下轮验证)
+      const mag = Math.hypot(mx, my);
+      if (mag > opts.maxTotalShift) {
+        // 饱和中值幅度已失真且大偏差下方向可能指向自相似相邻环，不给方向建议 (UI 层提示用差值模式粗对齐)
+        return { ok: false, message: `粗对齐偏差超过微调范围 (±${opts.maxTotalShift}px)，请先继续拖动滑块把圆环对齐到更靠近的位置` };
+      }
+      const tx2 = tx + mx, ty2 = ty + my;
+      results = searchOnce(tx2, ty2);
+      roundsUsed = 2;
+      if (!results.length) return { ok: false, message: '搜索窗口越出图B边界，请先将圆环粗对齐到更靠近的位置' };
+      usable = results.filter(r => r.score >= opts.scoreMin && !r.saturated);
+      if (usable.length) {
+        // 第二轮可信修正叠加首轮饱和中值；若仍饱和则说明偏差超出累计上限，拒绝 (防止滑向相邻环伪峰)
+        if (usable.length < 2) {
+          return { ok: false, message: '第二轮微调可靠模板不足无法交叉验证，结果不可靠，请继续粗对齐后再试' };
+        }
+        const spread = spreadOf(usable);
+        if (spread > opts.consistencyThreshold) {
+          return { ok: false, message: `多模板微调修正量不一致 (最大差 ${spread.toFixed(1)}px > ${opts.consistencyThreshold}px)，环纹自相似歧义不可靠` };
+        }
+        const fx = mx + median(usable.map(r => r.dx)), fy = my + median(usable.map(r => r.dy));
+        if (Math.hypot(fx, fy) > opts.maxTotalShift) {
+          // 总修正含饱和分量 (幅度失真)，大偏差下方向也可能指向自相似相邻环，不给方向建议
+          return { ok: false, message: `粗对齐偏差超过微调范围 (±${opts.maxTotalShift}px)，请先继续拖动滑块把圆环对齐到更靠近的位置` };
+        }
+        console.log(`[精细对齐] ${roundsUsed} 轮收敛, 总修正 δ(${fx.toFixed(2)}, ${fy.toFixed(2)}) → 绘制偏移 (${(tx + fx).toFixed(1)}, ${(ty + fy).toFixed(1)})`);
+        return { ok: true, dx: tx + fx, dy: ty + fy, score: Math.min(...usable.map(r => r.score)), detail: `${roundsUsed}轮迭代, 修正 (${fx.toFixed(1)}, ${fy.toFixed(1)})px` };
+      }
+      // 大偏差下饱和峰方向可能指向自相似相邻环 (伪峰)，不给方向建议，避免误导手动调整 (UI 层提示用差值模式粗对齐)
+      return { ok: false, message: `粗对齐偏差超过微调范围 (±${opts.maxTotalShift}px)，请先继续拖动滑块把圆环对齐到更靠近的位置` };
+    }
+    if (!usable.length) {
+      const best = results.reduce((a, b) => (b.score > a.score ? b : a));
+      return { ok: false, message: `重叠区纹理匹配得分过低 (${best.score.toFixed(3)} < ${opts.scoreMin})，请重新粗对齐` };
+    }
+    // 单轮收敛: 多模板修正量一致性验证 (环纹自相似伪匹配在不同模板上修正量彼此矛盾)
+    const spread = spreadOf(usable);
+    if (usable.length >= 2 && spread > opts.consistencyThreshold) {
+      return { ok: false, message: `多模板微调修正量不一致 (最大差 ${spread.toFixed(1)}px > ${opts.consistencyThreshold}px)，环纹自相似歧义不可靠` };
+    }
+    const dx = median(usable.map(r => r.dx)), dy = median(usable.map(r => r.dy));
+    // 饱和模板与可用修正的交叉一致性: 真实平移对所有模板峰位一致；若有模板峰触边界 (声称修正≥R)
+    // 而可用修正却小得多，彼此矛盾必为自相似伪峰，拒绝 (宁可提示继续粗对齐，也不把图移偏)
+    const satList = results.filter(r => r.saturated);
+    if (satList.length) {
+      let cross = 0;
+      for (const s of satList) cross = Math.max(cross, Math.hypot(s.dx - dx, s.dy - dy));
+      if (cross > opts.consistencyThreshold) {
+        return { ok: false, message: `部分模板峰值触及搜索边界与其它模板修正矛盾 (差 ${cross.toFixed(1)}px)，环纹自相似歧义不可靠` };
+      }
+    }
+    if (Math.hypot(dx, dy) > opts.maxTotalShift) {
+      return { ok: false, suggestion: { dx, dy }, message: `粗对齐偏差超过微调范围 (±${opts.maxTotalShift}px)，请先继续拖动滑块把圆环对齐到更靠近的位置` };
+    }
+    const minScore = Math.min(...usable.map(r => r.score));
+    console.log(`[精细对齐] ${roundsUsed} 轮收敛, ${usable.length}/${results.length} 模板可用, 一致性差 ${spread.toFixed(2)}px, ` +
+      `修正 δ(${dx.toFixed(2)}, ${dy.toFixed(2)}) → 绘制偏移 (${(tx + dx).toFixed(1)}, ${(ty + dy).toFixed(1)})`);
+    return {
+      ok: true,
+      dx: tx + dx,
+      dy: ty + dy,
+      score: minScore,
+      detail: `${usable.length}模板, 最低得分 ${minScore.toFixed(3)}, 修正 (${dx.toFixed(1)}, ${dy.toFixed(1)})px${usable.length === 1 ? ' (单模板, 请核对)' : ''}`
+    };
+  } catch (e) {
+    return { ok: false, message: e.message || '精细对齐异常' };
+  } finally {
+    for (const m of mats) m.delete();
+    grayA?.delete?.();
+    grayB?.delete?.();
+  }
+}
+
+// 精细微调模板选位: 策略同粗对齐模板选位，模板自身避开叉丝带，且搜索窗口不越出图边界 (叉丝带由匹配阶段中和处理)
+function pickFineTemplates(gray, rough, tSize, vLine, hLine, searchR, count) {
+  const rows = gray.rows, cols = gray.cols;
+  const data = gray.data;
+  const half = tSize / 2;
+  const rBase = Math.min(cols, rows);
+  const radii = [0.16, 0.24, 0.32].map(f => f * rBase);
+  const angles = [0, 45, 90, 135, 180, 225, 270, 315].map(d => d * Math.PI / 180);
+  const cands = [];
+  for (const r of radii) {
+    for (const a of angles) {
+      const cx = rough.x + r * Math.cos(a);
+      const cy = rough.y + r * Math.sin(a);
+      const x0 = Math.round(cx - half), y0 = Math.round(cy - half);
+      const x1 = x0 + tSize, y1 = y0 + tSize;
+      if (x0 < 2 || y0 < 2 || x1 > cols - 2 || y1 > rows - 2) continue;
+      // 搜索窗口在模板四周外扩 searchR，必须完整落在图内 (偏移较大时靠边候选自然淘汰)
+      if (x0 - searchR < 1 || y0 - searchR < 1 || x1 + searchR > cols - 1 || y1 + searchR > rows - 1) continue;
+      if (rectHitsCrosshair(x0, y0, x1, y1, vLine, hLine, 8)) continue; // 模板本身避开叉丝
+      // 区域纹理度 = 像素方差 (隔行采样提速)
+      let sum = 0, sumSq = 0, cnt = 0;
+      for (let y = y0; y < y1; y += 2) {
+        const off = y * cols;
+        for (let x = x0; x < x1; x += 2) {
+          const v = data[off + x];
+          sum += v; sumSq += v * v; cnt++;
+        }
+      }
+      const variance = sumSq / cnt - (sum / cnt) ** 2;
+      if (variance < 60) continue;
+      cands.push({ x0, y0, variance });
+    }
+  }
+  cands.sort((a, b) => b.variance - a.variance);
+  const picked = [];
+  const minGap = tSize * 1.2;
+  for (const c of cands) {
+    if (picked.length >= count) break;
+    const ccx = c.x0 + tSize / 2, ccy = c.y0 + tSize / 2;
+    if (picked.every(p => Math.hypot(p.x0 + tSize / 2 - ccx, p.y0 + tSize / 2 - ccy) >= minGap)) picked.push(c);
+  }
+  return picked;
+}
+
+// 单模板局部精细搜索: 在图B中围绕期望位置 ±R 窗口内搜索最优修正量 (期望位置 = A模板位置 − 当前绘制偏移)；
+// 搜索窗口内的叉丝带用窗口均值填充中和 (固定前景不中和会在 NCC 中制造虚假高分)，中间 Mat 推入 mats 由调用方释放。
+// 修正量符号: 峰位偏左(小)说明图B内容实际更靠左，绘制偏移需增大 → δ = R − 峰位
+function matchTemplateNear(grayA, grayB, sel, tSize, tx, ty, R, vLine, hLine, mats) {
+  const wx0 = sel.x0 - tx - R, wy0 = sel.y0 - ty - R;
+  const wSize = tSize + 2 * R;
+  if (wx0 < 0 || wy0 < 0 || wx0 + wSize > grayB.cols || wy0 + wSize > grayB.rows) return null;
+  const tmpl = grayA.roi(new cv.Rect(sel.x0, sel.y0, tSize, tSize));
+  const win = grayB.roi(new cv.Rect(wx0, wy0, wSize, wSize)).clone();
+  mats.push(tmpl, win);
+  if (vLine || hLine) {
+    // 窗口均值 (隔行隔列抽样)
+    const d = win.data;
+    let sum = 0, cnt = 0;
+    for (let y = 0; y < wSize; y += 4) {
+      const off = y * wSize;
+      for (let x = 0; x < wSize; x += 4) { sum += d[off + x]; cnt++; }
+    }
+    const mean = sum / cnt;
+    const fill = new cv.Scalar(mean, mean, mean, 255);
+    const ext = 2; // 叉丝带外扩宽度 (含检测半宽)
+    if (vLine) {
+      const lx = vLine.pos - wx0;
+      cv.rectangle(win, new cv.Point(lx - vLine.half - ext, 0), new cv.Point(lx + vLine.half + ext, wSize - 1), fill, -1);
+    }
+    if (hLine) {
+      const ly = hLine.pos - wy0;
+      cv.rectangle(win, new cv.Point(0, ly - hLine.half - ext), new cv.Point(wSize - 1, ly + hLine.half + ext), fill, -1);
+    }
+  }
+  const result = new cv.Mat();
+  mats.push(result);
+  cv.matchTemplate(win, tmpl, result, cv.TM_CCOEFF_NORMED);
+  const mm = cv.minMaxLoc(result);
+  const span = 2 * R; // 结果边长 = span + 1，峰位索引范围 [0, span]，触及边缘视为修正量饱和 (需更大搜索范围)
+  const saturated = mm.maxLoc.x <= 0 || mm.maxLoc.x >= span || mm.maxLoc.y <= 0 || mm.maxLoc.y >= span;
+  let px = mm.maxLoc.x, py = mm.maxLoc.y;
+  if (!saturated) {
+    const sub = subpixelPeak(result, px, py);
+    if (sub) { px = sub.x; py = sub.y; }
+  }
+  return { score: mm.maxVal, saturated, dx: R - px, dy: R - py };
+}
+
+// 指定圆心初值重拟合: 复用 fitRingCenter 的预处理 (去叉丝+增强) 与逐环径向对称精修管线，
+// 仅把粗圆心假设替换为外部给定初值 (宽窗口两轮+像素级三轮收敛)。供⑥两阶段拟合对齐两图参考系。
+function fitRingCenterSeeded(src, label, seedX, seedY) {
+  let gray = null, denoised = null, wireMask = null, clean = null, enhanced = null;
+  try {
+    gray = new cv.Mat();
+    cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+    denoised = new cv.Mat();
+    cv.medianBlur(gray, denoised, 3);
+    const { vLine, hLine } = detectCrosshair(denoised);
+    clean = new cv.Mat();
+    if (vLine || hLine) {
+      wireMask = new cv.Mat(denoised.rows, denoised.cols, cv.CV_8UC1, new cv.Scalar(0));
+      const white = new cv.Scalar(255, 255, 255, 255);
+      if (vLine) cv.rectangle(wireMask, new cv.Point(vLine.pos - vLine.half, 0), new cv.Point(vLine.pos + vLine.half, denoised.rows - 1), white, -1);
+      if (hLine) cv.rectangle(wireMask, new cv.Point(0, hLine.pos - hLine.half), new cv.Point(denoised.cols - 1, hLine.pos + hLine.half), white, -1);
+      cv.inpaint(denoised, wireMask, clean, 3, cv.INPAINT_TELEA);
+    } else {
+      denoised.copyTo(clean);
+    }
+    enhanced = enhancedMat(clean);
+    const minDim = Math.min(denoised.cols, denoised.rows);
+    const circles = new cv.Mat();
+    cv.HoughCircles(
+      enhanced, circles, cv.HOUGH_GRADIENT,
+      1, minDim * 0.04,
+      60, 15,
+      Math.round(minDim * 0.04), Math.round(minDim * 0.45)
+    );
+    const raw = [];
+    for (let i = 0; i < circles.cols; i++) {
+      raw.push({ cx: circles.data32F[i * 3], cy: circles.data32F[i * 3 + 1], r: circles.data32F[i * 3 + 2] });
+    }
+    circles.delete();
+    if (raw.length === 0) return { ok: false, message: '霍夫圆未检测到圆环' };
+    raw.sort((a, b) => a.r - b.r);
+    const groups = [];
+    for (const c of raw) {
+      const last = groups[groups.length - 1];
+      if (last && Math.abs(c.r - last.r) < Math.max(4, last.r * 0.04)) continue;
+      groups.push({ ...c });
+    }
+    if (groups.length > 24) groups.length = 24;
+    const wireFree = (x, y) => {
+      if (vLine && Math.abs(x - vLine.pos) <= vLine.half) return false;
+      if (hLine && Math.abs(y - hLine.pos) <= hLine.half) return false;
+      return true;
+    };
+    // 指定初值宽窗口一轮 → 中值更新 → 窄窗口二轮收敛 (与 fitRingCenter 同构)。
+    // 种子偏差 = 粗对齐残差，最大 ±36 (与 ⑥ maxTotalShift 一致)，一轮窗口 ±40 需完整覆盖 (步长4控开销)
+    const rings = [];
+    for (const g of groups) {
+      const ref = refineRingCenter(enhanced, seedX, seedY, g.r, wireFree, 40, 4);
+      if (ref) rings.push({ ...ref, r: g.r });
+    }
+    if (rings.length < 2) return { ok: false, message: '指定初值精修后可用圆环不足' };
+    const cx1 = median(rings.map(p => p.cx));
+    const cy1 = median(rings.map(p => p.cy));
+    const r2 = [];
+    for (const g of groups) {
+      const ref = refineRingCenter(enhanced, cx1, cy1, g.r, wireFree, 12);
+      if (ref) r2.push({ ...ref, r: g.r });
+    }
+    if (r2.length < 2) return { ok: false, message: '指定初值二轮精修后可用圆环不足' };
+    let cx = median(r2.map(p => p.cx));
+    let cy = median(r2.map(p => p.cy));
+    const r3 = [];
+    for (const p of r2) {
+      const ref = refineRingCenter(enhanced, p.cx, p.cy, p.r, wireFree, 3, 1);
+      if (ref) r3.push({ ...ref, r: p.r });
+    }
+    const ringsFinal = r3.length >= 2 ? r3 : r2;
+    if (r3.length >= 2) {
+      cx = median(r3.map(p => p.cx));
+      cy = median(r3.map(p => p.cy));
+    }
+    const supported = ringsFinal.filter(p => Math.hypot(p.cx - cx, p.cy - cy) <= DEFAULT_OPTIONS.maxDispersion);
+    if (supported.length < 2) return { ok: false, message: `支撑圆环不足 (${supported.length})` };
+    const dispersion = Math.max(...supported.map(p => Math.hypot(p.cx - cx, p.cy - cy)));
+    console.log(`[圆心拟合] 图${label} 指定初值(${seedX.toFixed(1)}, ${seedY.toFixed(1)}) 支撑环 ${supported.length}/${ringsFinal.length} 个, 离散度 ${dispersion.toFixed(2)}px: ` +
+      supported.map(p => `r=${p.r.toFixed(0)}@(${p.cx.toFixed(1)},${p.cy.toFixed(1)})`).join(' | '));
+    if (dispersion > DEFAULT_OPTIONS.maxDispersion * 2) {
+      return { ok: false, message: `圆心离散度过大 (${dispersion.toFixed(1)}px)` };
+    }
+    return { ok: true, cx, cy, rings: supported, dispersion };
+  } finally {
+    gray?.delete?.();
+    denoised?.delete?.();
+    wireMask?.delete?.();
+    clean?.delete?.();
+    enhanced?.delete?.();
+  }
+}
+
+// ---------- ⑦ 手动粗对齐质量检查 (只读判定，不改变偏移) ----------
+// 原理: 两图独立拟合环系圆心，按当前绘制偏移 (tx, ty) 换算后两圆心应重合；残差即对齐误差。
+// 返回 { ok, dev, centerA, centerB, suggestion?, message }，供 UI 判定"手动重叠是否准确"并给出调整方向；
+// suggestion 为建议的绘制偏移增量 (+Δx=图B右移)，偏差超限时仅供方向参考不自动应用。
+export async function verifyOverlayOffset(calibImageA, calibImageB, tx, ty) {
+  const imgElA = await loadImageEl(calibImageA.src);
+  const imgElB = await loadImageEl(calibImageB.src);
+  let srcA = null, srcB = null, smallA = null, smallB = null;
+  try {
+    srcA = cv.imread(imgElA);
+    srcB = cv.imread(imgElB);
+    if (srcA.rows !== srcB.rows || srcA.cols !== srcB.cols) {
+      return { ok: false, message: '两图尺寸不一致' };
+    }
+    // 缩图加速: 全尺寸大图上霍夫圆检测+三轮逐环精修耗时可达数十秒并阻塞主线程 (界面卡死)；
+    // 长边超过上限时先缩到 ≤900px 再拟合，结果换算回原图像素 (环系圆心是几何中心，缩放不改变相对结构，
+    // INTER_AREA 保留环纹梯度信息)，拟合耗时降至 1~2 秒级。
+    const MAX_DIM = 900;
+    const scale = Math.min(1, MAX_DIM / Math.max(srcA.rows, srcA.cols));
+    let fitSrcA = srcA, fitSrcB = srcB;
+    if (scale < 1) {
+      const dsize = new cv.Size(Math.max(1, Math.round(srcA.cols * scale)), Math.max(1, Math.round(srcA.rows * scale)));
+      smallA = new cv.Mat(); smallB = new cv.Mat();
+      cv.resize(srcA, smallA, dsize, 0, 0, cv.INTER_AREA);
+      cv.resize(srcB, smallB, dsize, 0, 0, cv.INTER_AREA);
+      dsize.delete();
+      fitSrcA = smallA; fitSrcB = smallB;
+    }
+    const fitA = fitRingCenter(fitSrcA, 'A');
+    const fitB = fitRingCenter(fitSrcB, 'B');
+    if (!fitA.ok) return { ok: false, message: `图A 圆环拟合失败 (${fitA.message})` };
+    if (!fitB.ok) return { ok: false, message: `图B 圆环拟合失败 (${fitB.message})` };
+    // 拟合坐标换算回原图像素口径 (与传入的 tx, ty 同单位)
+    const centerA = { x: fitA.cx / scale, y: fitA.cy / scale };
+    const centerB = { x: fitB.cx / scale, y: fitB.cy / scale };
+    // 图B圆心按当前绘制偏移换算到图A坐标系，与图A圆心之差 = 对齐残差 (对齐良好时两圆心重合)
+    const ex = (centerB.x + tx) - centerA.x;
+    const ey = (centerB.y + ty) - centerA.y;
+    const dev = Math.hypot(ex, ey);
+    console.log(`[对齐检查] 心A=(${centerA.x.toFixed(1)}, ${centerA.y.toFixed(1)}) [${fitA.rings.length}环], 心B=(${centerB.x.toFixed(1)}, ${centerB.y.toFixed(1)}) [${fitB.rings.length}环], ` +
+      `当前偏移(${tx}, ${ty}) 下残差=${dev.toFixed(2)}px${scale < 1 ? ` (缩图 ${scale.toFixed(2)}x)` : ''}`);
+    return {
+      ok: true,
+      dev,
+      centerA,
+      centerB,
+      detail: `环数 ${fitA.rings.length}/${fitB.rings.length}, 离散度 ${(fitA.dispersion / scale).toFixed(2)}/${(fitB.dispersion / scale).toFixed(2)}px`,
+      suggestion: dev > 0 ? { dx: -ex, dy: -ey } : null
+    };
+  } catch (e) {
+    return { ok: false, message: e.message || '对齐检查异常' };
+  } finally {
+    srcA?.delete?.();
+    srcB?.delete?.();
+    smallA?.delete?.();
+    smallB?.delete?.();
+  }
+}
+// ---------- ⑥ 基于多环圆心拟合的精细对齐 (叠加对齐首选通路) ----------
+// 原理: 牛顿环半径满足 r_k ∝ √k，每环绝对半径全局唯一 (相邻环仅局部纹理自相似)；
+// 两图各自独立拟合多环圆心，用"跨图平移一致性"聚类匹配环序对，圆心差即平移量。
+// 与 ⑤ 局部模板搜索互补: 整圈采样免疫局部纹理歧义，粗对齐偏差较大也能直接给出结果；
+// 但仍尊重"精细对齐只在小范围微调"的需求: 拟合结果与当前偏移相差超限时拒绝。
+// 返回的 dx, dy 为建议新绘制偏移 (浮点亚像素，与传入的 tx, ty 同口径)
+export async function refineTranslationByRings(calibImageA, calibImageB, tx, ty, options = {}) {
+  const opts = {
+    minRings: 4,               // 最少一致匹配环对数 (环序匹配需足够支撑)
+    ringRadiusTol: 0.04,       // 环序半径匹配容差 (占半径比例，下限 2px)
+    consistencyThreshold: 2.0, // 逐环平移偏差最大允许差 (px)
+    maxDispersion: 6.0,        // 单图拟合逐环圆心离散度上限 (px)
+    maxTotalShift: 36,         // 拟合结果与当前偏移差值上限 (px): 精细对齐只在小范围内微调
+    ...options
+  };
+  const imgElA = await loadImageEl(calibImageA.src);
+  const imgElB = await loadImageEl(calibImageB.src);
+  let srcA = null, srcB = null;
+  try {
+    srcA = cv.imread(imgElA);
+    srcB = cv.imread(imgElB);
+    if (srcA.rows !== srcB.rows || srcA.cols !== srcB.cols) {
+      return { ok: false, message: '两图尺寸不一致' };
+    }
+    const fitA = fitRingCenter(srcA, 'A');
+    if (!fitA.ok) return { ok: false, message: `图A圆环拟合失败 (${fitA.message})` };
+    // 图B拟合以"图A圆心按当前偏移反推"为种子: 粗对齐后两环系已接近重合，图B真圆心应在 cA − t 附近 (残差=粗对齐误差，
+    // 在精修收敛窗内)。独立拟合的粗圆心初值可能落入伪圆盆地 (暗场自相似)，种子化可避免两图参考系错位。
+    // 种子仅指导拟合初值，结果仍由半径匹配+逐环平移一致性独立验证，种子偏差时自然被拒。
+    let fitB = fitRingCenterSeeded(srcB, 'B', fitA.cx - tx, fitA.cy - ty);
+    if (!fitB.ok) {
+      console.log(`[精细对齐/环拟合] 图B种子化重拟合失败 (${fitB.message})，改用独立拟合`);
+      fitB = fitRingCenter(srcB, 'B');
+    }
+    if (!fitB.ok) return { ok: false, message: `图B圆环拟合失败 (${fitB.message})` };
+    if (fitA.rings.length < 3 || fitB.rings.length < 3) {
+      return { ok: false, message: `可用圆环不足 (${fitA.rings.length}/${fitB.rings.length})` };
+    }
+    if (Math.max(fitA.dispersion, fitB.dispersion) > opts.maxDispersion) {
+      return { ok: false, message: `圆心离散度过大 (${fitA.dispersion.toFixed(2)}/${fitB.dispersion.toFixed(2)}px)，拟合质量不足` };
+    }
+    // 环序匹配: 半径相近的环组成候选对，再用平移一致性聚类 (真实平移对全部同序环一致，
+    // 错序伪对 (相邻环自相似) 的平移彼此矛盾被淘汰)。确定性两轮中值共识 (无随机抽样，结果可复现):
+    // 先全对中值估基准平移，剔除偏差对后再中值合成，错序伪对偏移大 (> 环间距) 首轮即出局
+    const pairs = [];
+    for (const ra of fitA.rings) {
+      for (const rb of fitB.rings) {
+        if (Math.abs(ra.r - rb.r) <= Math.max(2, Math.min(ra.r, rb.r) * opts.ringRadiusTol)) {
+          pairs.push({ ax: ra.cx, ay: ra.cy, bx: rb.cx, by: rb.cy });
+        }
+      }
+    }
+    if (!pairs.length) {
+      console.log(`[精细对齐/环拟合] 半径不匹配: A支撑环 [${fitA.rings.map(p => p.r.toFixed(0)).join(',')}], B支撑环 [${fitB.rings.map(p => p.r.toFixed(0)).join(',')}]`);
+      return { ok: false, message: '未找到半径匹配的环对 (两图环系差异过大)' };
+    }
+    const mx0 = median(pairs.map(p => p.bx - p.ax));
+    const my0 = median(pairs.map(p => p.by - p.ay));
+    const inliers = pairs.filter(p =>
+      Math.abs((p.bx - p.ax) - mx0) <= opts.consistencyThreshold &&
+      Math.abs((p.by - p.ay) - my0) <= opts.consistencyThreshold);
+    if (inliers.length < opts.minRings) {
+      return { ok: false, message: `一致匹配的圆环不足 (${inliers.length} < ${opts.minRings})，环序匹配歧义` };
+    }
+    // 中值合成平移并复核一致性 (从严验证)
+    const dxB = median(inliers.map(p => p.bx - p.ax));
+    const dyB = median(inliers.map(p => p.by - p.ay));
+    let spread = 0;
+    for (const p of inliers) spread = Math.max(spread, Math.hypot((p.bx - p.ax) - dxB, (p.by - p.ay) - dyB));
+    if (spread > opts.consistencyThreshold) {
+      return { ok: false, message: `逐环平移偏差超限 (最大 ${spread.toFixed(2)}px)，环序匹配不可靠` };
+    }
+    // B相对A平移 d = (dxB, dyB)；绘制偏移 t = −d (图B像素 b 显示在 b + t 处)
+    const tNewX = -dxB, tNewY = -dyB;
+    const dev = Math.hypot(tNewX - tx, tNewY - ty);
+    if (dev > opts.maxTotalShift) {
+      // 拟合目标明确，附带手动粗对齐方向建议 (修正量 = 目标偏移 − 当前偏移，幅度可信)
+      return { ok: false, suggestion: { dx: tNewX - tx, dy: tNewY - ty }, message: `粗对齐偏差超过微调范围 (拟合结果与当前偏移差 ${dev.toFixed(1)}px > ±${opts.maxTotalShift}px)，请先继续拖动滑块把圆环对齐到更靠近的位置` };
+    }
+    console.log(`[精细对齐/环拟合] 匹配 ${inliers.length}/${pairs.length} 对, 偏差 ${spread.toFixed(2)}px, ` +
+      `d=(${dxB.toFixed(2)}, ${dyB.toFixed(2)}) → 绘制偏移 (${tNewX.toFixed(2)}, ${tNewY.toFixed(2)}) [当前 (${tx.toFixed(1)}, ${ty.toFixed(1)})]`);
+    return {
+      ok: true,
+      method: '圆心拟合',
+      dx: tNewX, dy: tNewY,
+      detail: `${inliers.length}环匹配, 偏差 ${spread.toFixed(2)}px, 离散度 ${Math.max(fitA.dispersion, fitB.dispersion).toFixed(2)}px`,
+      centerA: { x: fitA.cx, y: fitA.cy },
+      centerB: { x: fitB.cx, y: fitB.cy }
+    };
+  } catch (e) {
+    return { ok: false, message: e.message || '环拟合精细对齐异常' };
+  } finally {
+    srcA?.delete?.();
+    srcB?.delete?.();
+  }
+}
