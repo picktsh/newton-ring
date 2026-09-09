@@ -1,5 +1,6 @@
 .idea
 .vscode
+.qoder
 .git
 .DS_Store
 node_modules
