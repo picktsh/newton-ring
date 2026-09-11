@@ -1,5 +1,17 @@
 import { LAMBDA, INSTRUMENT_ERROR } from './constants.js';
 
+// 环半径取值: 优先椭圆拟合的长短半轴均值 (亚像素, 精度高), 椭圆缺失/退化时回退 avgRadius。
+// 旧缓存里的 avgRadius 是「4 个整数关键点距离平均」(会出现 .00 假精度), 但 ellipse 对象已随环缓存,
+// 故对旧数据也能现算出亚像素半径, 无需重新处理; 新识别的环在源头已把 avgRadius 改为椭圆值。
+// 导出供 app.js 表1 模板直接调用 (表1 直径单元格读的是 ring 对象, 不走 diameterData)。
+export function ringRadius(ring) {
+    const e = ring?.ellipse;
+    if (e && e.size && e.size.width > 0 && e.size.height > 0) {
+        return (e.size.width + e.size.height) / 4;
+    }
+    return ring?.avgRadius ?? 0;
+}
+
 // 计算各暗环直径数据
 export function calculateDiameterData(detectedRings, pixelScale) {
     if (!detectedRings || detectedRings.length === 0) {
@@ -7,8 +19,8 @@ export function calculateDiameterData(detectedRings, pixelScale) {
     }
     return detectedRings.map(ring => ({
         number: ring.number,
-        diameterPixel: ring.avgRadius * 2,
-        diameterMM: ring.avgRadius * 2 * pixelScale
+        diameterPixel: ringRadius(ring) * 2,
+        diameterMM: ringRadius(ring) * 2 * pixelScale
     }));
 }
 
@@ -30,8 +42,8 @@ export function calculateRadiusData(detectedRings, pixelScale, step = 3) {
         const ringN = detectedRings.find(r => r.number === group.n);
 
         if (ringM && ringN) {
-            const Dm = ringM.avgRadius * 2 * pixelScale;
-            const Dn = ringN.avgRadius * 2 * pixelScale;
+            const Dm = ringRadius(ringM) * 2 * pixelScale;
+            const Dn = ringRadius(ringN) * 2 * pixelScale;
             // R = (Dm² - Dn²) / [4(m-n)λ]
             const diffSquared = Math.pow(Dm, 2) - Math.pow(Dn, 2);
             const R = (diffSquared * 1e-6) / (4 * (group.m - group.n) * LAMBDA);

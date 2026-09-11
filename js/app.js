@@ -4,8 +4,8 @@
 import { createImageManager } from './image-manager.js';
 import { detectNewtonRingCenter, detectRingsWithCenter, mergeAndNumberRings, extractRingDataForManual } from './image-processor.js';
 import { initCanvasInteraction, onTableRowHover, onTableRowLeave, initDragDrop, initCenterAdjustInteraction } from './interaction-handler.js';
-import { calculateDiameterData, calculateRadiusData, calculateAverageRadius, generateCalculationResults, calculateRadiusUncertainty } from './data-calculator.js';
-import { drawDetectionResults, clearCanvas, drawCenterOverlay } from './canvas-drawer.js';
+import { calculateDiameterData, calculateRadiusData, calculateAverageRadius, generateCalculationResults, calculateRadiusUncertainty, ringRadius } from './data-calculator.js';
+import { drawDetectionResults, clearCanvas, drawCenterOverlay, drawOverlay } from './canvas-drawer.js';
 import {
     refineTranslationNear, refineTranslationByRings, verifyOverlayOffset, loadImageEl
 } from './image-registrator.js';
@@ -29,6 +29,7 @@ export default {
         watch(activeTab, (val) => {
             sessionStorage.setItem('activeTab', val);
             if (val !== 'calibration') stopOverlayBlink();
+            if (val !== 'rings') closeZoomModal();   // 离开环纹板块: 关掉全屏放大弹窗，避免坐标口径失效后残留
         });
         // ===== 像素标定状态 =====
         // ===== 像素标定 sessionStorage 缓存 =====
@@ -310,6 +311,16 @@ export default {
             }
             return filters.join(' ') || 'none';
         });
+        // ===== 识别结果观看模式: 彩色 / 灰度 (默认彩色, 不记忆) =====
+        // 纯显示层开关: 只作用底图 <img> 的 CSS 滤镜, 不动图像数据、不影响识别 (识别内部本就转灰度),
+        // 也不碰独立 canvas 上的彩色环标记 —— 灰底 + 彩环反而让暗纹更醒目。主视图与全屏共用同一状态。
+        const resultGrayscale = ref(false);        // false=彩色(默认) true=灰度
+        // 在现有预览滤镜之上叠加灰度: 彩色时原样返回 (默认滑块=0 即真彩色), 灰度时追加 grayscale(1)
+        const resultImageFilter = computed(() => {
+            const base = previewFilterStyle.value;
+            if (!resultGrayscale.value) return base;
+            return base === 'none' ? 'grayscale(1)' : base + ' grayscale(1)';
+        });
 
         const originalImageRef = ref(null);
         const resultCanvasRef = ref(null);
@@ -328,6 +339,69 @@ export default {
         const centerProcessedDataUrl = ref(null);  // 第一步预处理图缓存 (供识别环/补环复用)
         const detectedOuterRadius = ref(0);        // 外边界半径 (环搜索上限)
         let cleanupCenterAdjust = null;            // 圆心拖拽交互清理函数
+        // ===== 全屏放大补环: 一键自动取景 → 全屏弹窗等比放大 → 窗内点击补环 =====
+        // 补环只取「点击点到 detectedCenter 的距离」作半径 (extractRingDataForManual 沿整圈提取)，
+        // 故切向点偏不影响结果；圆心全程不参与、不改动，放大只为把鼠标点得更准。
+        // 几何口径: zoomScale = 屏幕像素/原图像素 (绝对倍率，因为全览适配值本身可能 <1)；
+        //           zoomOffset = 原图 (0,0) 相对视口左上角的偏移 (CSS 像素，可为负)；
+        //           原图像素点 (X,Y) 显示在视口 (offset.x + X*scale, offset.y + Y*scale)。
+        const zoomOpen = ref(false);               // 弹窗是否打开
+        const zoomCrop = ref(null);                // { x, y, w, h } 开窗时的自动取景框 (原图像素，仅定初始视野)
+        const zoomViewport = ref({ w: 0, h: 0 });  // 视口尺寸 (CSS 像素，开窗与窗口缩放时实测)
+        const zoomScale = ref(1);                  // 当前绝对倍率
+        const zoomOffset = ref({ x: 0, y: 0 });    // 当前平移偏移
+        const zoomCursor = ref(null);              // { x, y, r, inside } 鼠标处原图坐标与半径 (底部读数)
+        const zoomHoveredRing = ref(null);         // 弹窗内独立悬停态 (不复用 hoveredRingRef: 弹窗全屏遮挡，联动表1 零收益且会残留高亮)
+        const zoomStageRef = ref(null);            // 视口容器 (承载鼠标事件与钳制参考)
+        const zoomImgRef = ref(null);              // 底图 img (整幅原图，靠 left/top/width/height 缩放平移)
+        const zoomCanvasRef = ref(null);           // 标记层 canvas (固定铺满视口，靠 setTransform 映射原图坐标)
+        let zoomPan = null;                        // 平移拖拽会话 { sx, sy, ox, oy, moved }
+        const zoomPanning = ref(false);            // 拖拽进行中 (仅驱动光标样式，需响应式故不能只用 zoomPan)
+        let zoomSuppressClick = false;             // 平移拖拽松手后抑制紧随的 click，否则会凭空多补一个环
+        const ZOOM_MAX_SCALE = 8;                  // 放大上限 (屏幕像素/原图像素)，再大只是把马赛克放得更大
+        const ZOOM_WHEEL_STEP = 1.25;              // 滚轮每格倍率因子
+        const ZOOM_PAN_THRESHOLD = 5;              // 位移阈值 (CSS px): 超过即判定为平移而非补环点击 (全屏下手抖幅度同比放大)
+        const ZOOM_KEY_PAN_RATIO = 0.1;            // 方向键平移步长 = 视口宽/高的 10%，Shift 加速到 30%
+        // 按钮可用条件: 已完成环识别且至少有一个环 (与「环人工核对」面板同口径)
+        const zoomCanUse = computed(() => centerPhase.value === 'done' && ringList.value.length > 0);
+        // 整幅原图刚好塞进视口的倍率 = 缩小下限 (留一条退路: 取景框被 clamp 后并未涵盖全图时可看全貌)
+        const zoomScaleMin = computed(() => {
+            const img = imageManager.uploadedImage.value;
+            const V = zoomViewport.value;
+            if (!img?.width || !img?.height || !V.w || !V.h) return 0.01;
+            return Math.min(V.w / img.width, V.h / img.height);
+        });
+        // 底图几何: 整幅原图按绝对倍率缩放，再平移到 zoomOffset
+        const zoomImgStyle = computed(() => {
+            const img = imageManager.uploadedImage.value;
+            if (!img?.width || !img?.height) return { display: 'none' };
+            return {
+                position: 'absolute',
+                left: zoomOffset.value.x + 'px',
+                top: zoomOffset.value.y + 'px',
+                width: Math.round(img.width * zoomScale.value) + 'px',
+                height: Math.round(img.height * zoomScale.value) + 'px',
+                // 动态插值: 放大时最近邻(像素锐利、暗纹边界清楚)，缩小时平滑(防锯齿与摩尔纹把整圈环抹掉)
+                imageRendering: zoomScale.value >= 1 ? 'pixelated' : 'auto'
+            };
+        });
+        // 视口光标: 拖拽平移中 grabbing，其余 crosshair (事件全挂在视口上，因为缩小时底图未必铺满视口)
+        const zoomStageStyle = computed(() => ({
+            cursor: zoomPanning.value ? 'grabbing' : 'crosshair'
+        }));
+        // 当前视野内可见的启用环数 (帮你判断是否还需平移去找漏检的外环)
+        const zoomVisibleRingCount = computed(() => {
+            const V = zoomViewport.value;
+            const s = zoomScale.value;
+            const ox = zoomOffset.value.x, oy = zoomOffset.value.y;
+            // 视野对应的原图像素矩形
+            const x0 = -ox / s, y0 = -oy / s, x1 = (V.w - ox) / s, y1 = (V.h - oy) / s;
+            return enabledRings.value.filter(r => {
+                // 环 bbox 与视野矩形相交即算可见
+                return r.x + r.avgRadius >= x0 && r.x - r.avgRadius <= x1 &&
+                       r.y + r.avgRadius >= y0 && r.y - r.avgRadius <= y1;
+            }).length;
+        });
         // 当前选中的图片数据
         const currentImageData = computed(() => {
             return imageManager.getCurrentImageData();
@@ -1377,6 +1451,7 @@ export default {
                 centerPhase.value = 'idle';
                 detectedCenter.value = null;
                 centerProcessedDataUrl.value = null;
+                closeZoomModal();   // 重新处理会使弹窗的取景/坐标全部失效，直接关窗
                 detectedOuterRadius.value = 0;
                 resultImageSrcRef.value = null;
                 clearCanvas(resultCanvasRef.value);
@@ -1560,8 +1635,11 @@ export default {
         }
 
         // 加载预处理灰度图 (供点击补环提取实测环数据)
+        // 优先用识别时的预处理增强图; 若已失效 (刷新/缓存恢复后 centerProcessedDataUrl 丢失),
+        // 回退到原图直接转灰度 —— 补环只需沿圆周采样灰度强度, 原图灰度即可满足, 无需重跑完整预处理管线。
+        // 这样无论彩色/灰度观看模式、无论是否刷新过页面, 点击补环都可用。
         async function loadPreprocessedGrayMat() {
-            const url = centerProcessedDataUrl.value;
+            const url = centerProcessedDataUrl.value || imageManager.uploadedImage.value?.src;
             if (!url) return null;
             try {
                 const img = await new Promise((resolve, reject) => {
@@ -1584,36 +1662,27 @@ export default {
             }
         }
 
-        // 点击图像手动补环 (识别结束后的人工兜底：漏检的暗纹点一下即可补入)
-        async function completeRingAtClick(event) {
-            if (centerPhase.value !== 'done') return;
-            const imgEl = resultImageRef.value;
-            const canvas = resultCanvasRef.value;
-            if (!imgEl || !canvas) return;
+        // 补环核心: 输入原图像素坐标，只取「到圆心的距离」作半径 (主视图点击与全屏弹窗点击共用同一条路径)
+        // 返回是否补环成功 (供弹窗决定是否重绘)
+        async function addManualRingAt(px, py) {
             const center = detectedCenter.value || currentImageData.value?.center;
-            if (!center) return;
-            // 显示坐标 → 原始图像像素坐标 (与悬停检测同口径)
-            const rect = imgEl.getBoundingClientRect();
-            const scaleX = canvas.width / rect.width;
-            const scaleY = canvas.height / rect.height;
-            const px = (event.clientX - rect.left) * scaleX;
-            const py = (event.clientY - rect.top) * scaleY;
+            if (!center) return false;
             const radius = Math.sqrt(Math.pow(px - center.x, 2) + Math.pow(py - center.y, 2));
             if (radius < 5) {
                 showStatus('⚠️ 点击位置距圆心太近，无法补环', 'info');
-                return;
+                return false;
             }
             // 用预处理图提取该半径处的实测数据 (关键点/椭圆拟合)
             const grayMat = await loadPreprocessedGrayMat();
             if (!grayMat) {
                 showStatus('⚠️ 预处理图已失效，请点击“重新处理”后再补环', 'info');
-                return;
+                return false;
             }
             const ring = extractRingDataForManual(grayMat, center.x, center.y, radius);
             grayMat.delete();
             if (!ring) {
                 showStatus('❌ 补环失败：无法提取环数据', 'error');
-                return;
+                return false;
             }
             ring.manual = true;
             // 与现有环合并后按半径重新排序编号 (编号可再人工修改)
@@ -1621,6 +1690,22 @@ export default {
             imageManager.saveCurrentResultToCache(merged, center);
             nextTick(() => drawDetectionResults(resultCanvasRef, imageManager));
             showStatus(`✅ 已手动补环 (半径 ${radius.toFixed(1)}px)，编号已按半径重排，可手动修改`, 'success');
+            return true;
+        }
+
+        // 点击图像手动补环 (识别结束后的人工兜底：漏检的暗纹点一下即可补入)
+        async function completeRingAtClick(event) {
+            if (centerPhase.value !== 'done') return;
+            const imgEl = resultImageRef.value;
+            const canvas = resultCanvasRef.value;
+            if (!imgEl || !canvas) return;
+            // 显示坐标 → 原始图像像素坐标 (与悬停检测同口径)
+            const rect = imgEl.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            const px = (event.clientX - rect.left) * scaleX;
+            const py = (event.clientY - rect.top) * scaleY;
+            await addManualRingAt(px, py);
         }
 
         // Canvas交互包装函数 (含点击补环)
@@ -1632,8 +1717,316 @@ export default {
             }
         }
 
+        // ===== 全屏放大补环: 一键自动取景 → 滚轮缩放/拖拽平移 → 窗内点击补环 =====
+        // 自动取景: 以 detectedCenter 为中心、边长 2×外边界半径 的正方形，clamp 到图像内。
+        // 外边界 ≈ 最外环 ÷ 0.98 (环搜索上限就是外边界×0.98)，等于自动在最外环外留出余量，
+        // 而想补的「后面那几圈」恰好就在这个余量里。
+        function computeZoomCrop() {
+            const img = imageManager.uploadedImage.value;
+            const center = detectedCenter.value || currentImageData.value?.center;
+            if (!img?.width || !img?.height || !center) return null;
+            // detectedOuterRadius 不入缓存，刷新后从缓存恢复时为 0 → 退化用最外环半径 ×1.02
+            let R = detectedOuterRadius.value;
+            if (!(R > 0)) {
+                R = enabledRings.value.reduce((m, r) => Math.max(m, r.avgRadius), 0) * 1.02;
+            }
+            if (!(R > 0)) return { x: 0, y: 0, w: img.width, h: img.height };
+            const side = Math.max(24, Math.round(2 * R));
+            const w = Math.min(side, img.width);
+            const h = Math.min(side, img.height);
+            const x = Math.max(0, Math.min(img.width - w, Math.round(center.x - w / 2)));
+            const y = Math.max(0, Math.min(img.height - h, Math.round(center.y - h / 2)));
+            return { x, y, w, h };
+        }
+
+        function measureZoomViewport() {
+            const stage = zoomStageRef.value;
+            zoomViewport.value = stage
+                ? { w: stage.clientWidth || 0, h: stage.clientHeight || 0 }
+                : { w: 0, h: 0 };
+        }
+
+        // 平移钳制: 图像边界不得进入视口内部 (视口始终被图像铺满，不出现黑边)；
+        // 图像已缩小到小于视口时改为居中并禁止平移 (此时全图可见，平移没有意义)
+        function clampZoomOffset() {
+            const img = imageManager.uploadedImage.value;
+            const V = zoomViewport.value;
+            if (!img?.width || !img?.height || !V.w || !V.h) return;
+            const dispW = img.width * zoomScale.value;
+            const dispH = img.height * zoomScale.value;
+            const o = zoomOffset.value;
+            zoomOffset.value = {
+                x: dispW >= V.w ? Math.min(0, Math.max(V.w - dispW, o.x)) : (V.w - dispW) / 2,
+                y: dispH >= V.h ? Math.min(0, Math.max(V.h - dispH, o.y)) : (V.h - dispH) / 2
+            };
+        }
+
+        // 复位全览: 取景框刚好铺满视口 (等比)，圆心居中。不做双击复位:
+        // 双击的第一次 click 就已经把环补上了，无法回收
+        function resetZoomView() {
+            const crop = zoomCrop.value;
+            const V = zoomViewport.value;
+            if (!crop || !V.w || !V.h) return;
+            const s = Math.min(V.w / crop.w, V.h / crop.h);
+            zoomScale.value = Math.max(zoomScaleMin.value, Math.min(ZOOM_MAX_SCALE, s));
+            zoomOffset.value = {
+                x: V.w / 2 - (crop.x + crop.w / 2) * zoomScale.value,
+                y: V.h / 2 - (crop.y + crop.h / 2) * zoomScale.value
+            };
+            clampZoomOffset();
+            drawZoom();
+        }
+
+        function openZoomModal() {
+            if (!zoomCanUse.value) return;
+            const crop = computeZoomCrop();
+            if (!crop) {
+                showStatus('❌ 无法取景: 缺少圆心或图像尺寸', 'error');
+                return;
+            }
+            zoomCrop.value = crop;
+            zoomCursor.value = null;
+            zoomHoveredRing.value = null;
+            zoomSuppressClick = false;
+            zoomOpen.value = true;
+            // 每次开窗都重置到全览态 (不记忆上次缩放/平移): 补环会改变环列表，上次视野未必还对得上
+            nextTick(() => {
+                measureZoomViewport();
+                resetZoomView();
+            });
+            showStatus(`⛶ 已全屏放大: 取景 ${crop.w}×${crop.h}px (涵盖全部已识别环)，滚轮缩放 / 左键拖拽平移 / 左键点击补环，ESC 关闭`, 'success');
+        }
+
+        // 幂等关窗: 未开时仅清平移会话与抑制位，可安全重复调用
+        function closeZoomModal() {
+            if (zoomPan) {
+                document.removeEventListener('mousemove', onZoomPanMove);
+                document.removeEventListener('mouseup', onZoomPanEnd);
+                zoomPan = null;
+            }
+            zoomPanning.value = false;
+            zoomSuppressClick = false;
+            zoomOpen.value = false;
+            zoomCrop.value = null;
+            zoomCursor.value = null;
+            zoomHoveredRing.value = null;
+            zoomViewport.value = { w: 0, h: 0 };
+        }
+
+        function onZoomResize() {
+            if (!zoomOpen.value) return;
+            measureZoomViewport();
+            clampZoomOffset();
+            drawZoom();
+        }
+
+        // 以视口内 (vx, vy) 为不动点缩放: 你盯着哪圈环，放大后它还在指针下
+        function zoomScaleAt(vx, vy, factor) {
+            const old = zoomScale.value;
+            const next = Math.max(zoomScaleMin.value, Math.min(ZOOM_MAX_SCALE, old * factor));
+            if (next === old) return;
+            const ix = (vx - zoomOffset.value.x) / old;
+            const iy = (vy - zoomOffset.value.y) / old;
+            zoomScale.value = next;
+            zoomOffset.value = { x: vx - ix * next, y: vy - iy * next };
+            clampZoomOffset();
+            drawZoom();
+        }
+
+        function onZoomWheel(event) {
+            const stage = zoomStageRef.value;
+            if (!stage) return;
+            const rect = stage.getBoundingClientRect();
+            zoomScaleAt(event.clientX - rect.left, event.clientY - rect.top,
+                event.deltaY < 0 ? ZOOM_WHEEL_STEP : 1 / ZOOM_WHEEL_STEP);
+        }
+
+        // 左键拖拽平移: mousedown 在视口上，mousemove/mouseup 挂 document (拖出视口也能继续)
+        function onZoomMouseDown(event) {
+            if (!zoomOpen.value || event.button !== 0) return;
+            event.preventDefault();   // 阻止原生图片拖拽/文本选中 (否则拖拽平移会被浏览器拖图打断)
+            zoomPan = {
+                sx: event.clientX, sy: event.clientY,
+                ox: zoomOffset.value.x, oy: zoomOffset.value.y, moved: false
+            };
+            zoomPanning.value = true;
+            document.addEventListener('mousemove', onZoomPanMove);
+            document.addEventListener('mouseup', onZoomPanEnd);
+        }
+
+        function onZoomPanMove(event) {
+            if (!zoomPan) return;
+            const dx = event.clientX - zoomPan.sx;
+            const dy = event.clientY - zoomPan.sy;
+            if (!zoomPan.moved && Math.hypot(dx, dy) > ZOOM_PAN_THRESHOLD) zoomPan.moved = true;
+            if (!zoomPan.moved) return;
+            zoomOffset.value = { x: zoomPan.ox + dx, y: zoomPan.oy + dy };
+            clampZoomOffset();
+            drawZoom();
+        }
+
+        function onZoomPanEnd() {
+            document.removeEventListener('mousemove', onZoomPanMove);
+            document.removeEventListener('mouseup', onZoomPanEnd);
+            const pan = zoomPan;
+            zoomPan = null;
+            zoomPanning.value = false;
+            if (!pan) return;
+            // 只有真拖动过才抑制 click: 原地按下松开仍应正常补环
+            if (pan.moved) zoomSuppressClick = true;
+        }
+
+        // 视口坐标 → 原图像素坐标 (弹窗的倍率只影响鼠标精度，不进入任何计算)
+        function zoomEventToImageCoords(event) {
+            const stage = zoomStageRef.value;
+            if (!stage) return null;
+            const rect = stage.getBoundingClientRect();
+            if (!rect.width || !rect.height) return null;
+            const img = imageManager.uploadedImage.value;
+            const x = (event.clientX - rect.left - zoomOffset.value.x) / zoomScale.value;
+            const y = (event.clientY - rect.top - zoomOffset.value.y) / zoomScale.value;
+            return { x, y, inside: !!img && x >= 0 && y >= 0 && x < img.width && y < img.height };
+        }
+
+        function onZoomMouseMove(event) {
+            const p = zoomEventToImageCoords(event);
+            if (!p) return;
+            const center = detectedCenter.value || currentImageData.value?.center;
+            zoomCursor.value = {
+                x: p.x, y: p.y, inside: p.inside,
+                r: center ? Math.hypot(p.x - center.x, p.y - center.y) : 0
+            };
+            // 悬停命中判定与主视图同口径 (阈值在原图像素空间)
+            let hit = null;
+            for (const ring of enabledRings.value) {
+                const dist = Math.hypot(p.x - ring.x, p.y - ring.y);
+                if (Math.abs(dist - ring.avgRadius) < Math.max(8, ring.avgRadius * 0.05)) {
+                    hit = ring.number;
+                    break;
+                }
+            }
+            zoomHoveredRing.value = hit;
+            drawZoom();
+        }
+
+        function onZoomMouseLeave() {
+            zoomCursor.value = null;
+            zoomHoveredRing.value = null;
+            drawZoom();
+        }
+
+        // 窗内点击补环: 弹窗不关、立即重绘，可连续补; 主视图与表1/表2 同步刷新
+        async function onZoomClick(event) {
+            // 平移拖拽的松手不算补环点击
+            if (zoomSuppressClick) {
+                zoomSuppressClick = false;
+                return;
+            }
+            const p = zoomEventToImageCoords(event);
+            if (!p) return;
+            if (!p.inside) {
+                showStatus('⚠️ 请点击图像范围内 (画面外的空白区不能补环)', 'info');
+                return;
+            }
+            const ok = await addManualRingAt(p.x, p.y);
+            if (ok) drawZoom();
+        }
+
+        function onZoomImgLoad() {
+            drawZoom();
+        }
+
+        // 键盘 (仅弹窗打开时生效): ESC 关闭 / +− 缩放 / 方向键平移 (内容跟随按键方向移动，与滚动直觉一致)
+        // 与现有两个 keydown 监听无冲突: onCenterKeydown 只在 awaiting-center 生效、onCalibKeydown 只在标定页生效，补环阶段是 done
+        function onZoomKeydown(e) {
+            if (!zoomOpen.value) return;
+            // 输入框聚焦时不拦截 (表1 编号 input、像素标定 input 都要正常打字)
+            const ae = document.activeElement;
+            if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA')) return;
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                closeZoomModal();
+                showStatus('已关闭全屏放大弹窗', 'info');
+                return;
+            }
+            const V = zoomViewport.value;
+            if (e.key === '+' || e.key === '=') {
+                e.preventDefault();
+                zoomScaleAt(V.w / 2, V.h / 2, ZOOM_WHEEL_STEP);
+                return;
+            }
+            if (e.key === '-' || e.key === '_') {
+                e.preventDefault();
+                zoomScaleAt(V.w / 2, V.h / 2, 1 / ZOOM_WHEEL_STEP);
+                return;
+            }
+            const step = ZOOM_KEY_PAN_RATIO * (e.shiftKey ? 3 : 1);
+            let dx = 0, dy = 0;
+            switch (e.key) {
+                case 'ArrowUp': dy = V.h * step; break;
+                case 'ArrowDown': dy = -V.h * step; break;
+                case 'ArrowLeft': dx = V.w * step; break;
+                case 'ArrowRight': dx = -V.w * step; break;
+                default: return;
+            }
+            e.preventDefault();
+            zoomOffset.value = { x: zoomOffset.value.x + dx, y: zoomOffset.value.y + dy };
+            clampZoomOffset();
+            drawZoom();
+        }
+
+        // 标记层绘制: canvas 固定铺满视口 (位图不随倍率膨胀，避免 8x 下超出 canvas 面积上限)，
+        // 靠 setTransform 把原图像素坐标映射到视口坐标; unit = 1/scale 让线宽/字号保持恒定屏幕像素
+        function drawZoom() {
+            const canvas = zoomCanvasRef.value;
+            const V = zoomViewport.value;
+            if (!canvas || !V.w || !V.h) return;
+            const dpr = window.devicePixelRatio || 1;
+            const cw = Math.round(V.w * dpr);
+            const ch = Math.round(V.h * dpr);
+            if (canvas.width !== cw) canvas.width = cw;
+            if (canvas.height !== ch) canvas.height = ch;
+            const ctx = canvas.getContext('2d');
+            ctx.setTransform(1, 0, 0, 1, 0, 0);
+            ctx.clearRect(0, 0, cw, ch);
+            const scale = zoomScale.value;
+            const off = zoomOffset.value;
+            ctx.setTransform(scale * dpr, 0, 0, scale * dpr, off.x * dpr, off.y * dpr);
+            const unit = 1 / scale;
+            // 已识别环 (彩色渐变 + 白字黑底序号 + 人工环虚线) + 弹窗内独立悬停高亮
+            drawOverlay(ctx, enabledRings.value, zoomHoveredRing.value, unit);
+            // 圆心橙色小十字: 明确半径是从哪里量的
+            // (drawOverlay 自带的白十字取「各环 x/y 平均值」，与补环只认的 detectedCenter 可能略有出入)
+            const center = detectedCenter.value || currentImageData.value?.center;
+            if (!center) return;
+            const arm = 14 * unit;
+            ctx.lineWidth = 2 * unit;
+            ctx.strokeStyle = 'rgba(255, 165, 0, 1)';
+            ctx.beginPath();
+            ctx.moveTo(center.x - arm, center.y);
+            ctx.lineTo(center.x + arm, center.y);
+            ctx.moveTo(center.x, center.y - arm);
+            ctx.lineTo(center.x, center.y + arm);
+            ctx.stroke();
+            // 径向预览: 青色实线圆 = 这一点下去环会落在的位置 + 指向圆心的射线
+            // (实线专属预览、虚线专属人工补入的环，两种虚线不混淆)
+            // 圆心在视野外无需特判: canvas 自动裁剪，圆只剩一段弧、射线只剩可见段 (补外环时这是主路径)
+            const cur = zoomCursor.value;
+            if (!cur || !cur.inside) return;
+            ctx.lineWidth = 1.5 * unit;
+            ctx.strokeStyle = 'rgba(0, 255, 255, 0.9)';
+            ctx.beginPath();
+            ctx.arc(center.x, center.y, cur.r, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.beginPath();
+            ctx.moveTo(center.x, center.y);
+            ctx.lineTo(center.x + (cur.x - center.x) * 1.15, center.y + (cur.y - center.y) * 1.15);
+            ctx.stroke();
+        }
+
         // 从缓存恢复显示 (已识别过的图直接进入人工核对阶段)
         function restoreFromCache(resultData) {
+            closeZoomModal();   // 换图/删图后的恢复: 弹窗里的取景已不属于当前图，一律关掉
             drawDetectionResults(resultCanvasRef, imageManager);
             if (resultData?.detectedRings?.length > 0) {
                 centerPhase.value = 'done';
@@ -1653,6 +2046,7 @@ export default {
 
         // 图片切换处理
         function handleSwitchToImage(fingerprint) {
+            closeZoomModal();
             imageManager.switchToImage(fingerprint, (resultData) => {
                 resultImageSrcRef.value = imageManager.getOriginalImageSrc();
 
@@ -1671,6 +2065,7 @@ export default {
 
         // 删除图片处理
         function handleRemoveFromProcessedList(fingerprint) {
+            closeZoomModal();
             if (imageManager.currentFingerprint.value === fingerprint) {
                 clearCanvas(resultCanvasRef.value);
                 resultImageSrcRef.value = null;
@@ -1817,8 +2212,11 @@ export default {
             // 键盘方向键微调标定标记与圆心微调
             document.addEventListener('keydown', onCalibKeydown);
             document.addEventListener('keydown', onCenterKeydown);
+            document.addEventListener('keydown', onZoomKeydown);
             // 窗口宽度变化时更新截取区/叠加区显示比例 (两图按各自容器宽度自适应缩放)
             window.addEventListener('resize', updateDisplayScales);
+            // 全屏放大弹窗: 视口尺寸随窗口变化，需重测、重钳位并重绘 (弹窗未开时为 no-op)
+            window.addEventListener('resize', onZoomResize);
             // 恢复标定图片缓存后重绘叠加画面标记 (含缓存的多组特征点)
             loadCalibFromSession();
             nextTick(() => {
@@ -1826,9 +2224,12 @@ export default {
             });
         });
 
-        // 组件卸载: 清理闪烁定时器 (与其余事件监听同口径，不遗留后台动画)
+        // 组件卸载: 清理闪烁定时器与全屏放大弹窗的监听 (与其余事件监听同口径，不遗留后台动画/监听)
         onUnmounted(() => {
             stopOverlayBlink();
+            closeZoomModal();
+            document.removeEventListener('keydown', onZoomKeydown);
+            window.removeEventListener('resize', onZoomResize);
         });
 
         return {
@@ -1841,6 +2242,8 @@ export default {
             currentFingerprint: imageManager.currentFingerprint,
             filterParams,
             previewFilterStyle,
+            resultGrayscale,
+            resultImageFilter,
 
             originalImageRef,
             resultCanvasRef,
@@ -1858,6 +2261,7 @@ export default {
             averageRadius,
             radiusUncertainty,
             calculationResults,
+            ringRadius,
             hoveredRing: hoveredRingRef,
 
             // 两步确认流程 + 环人工核对
@@ -1874,6 +2278,13 @@ export default {
             onRenumberModeChange,
             diffStep,
             onDiffStepChange,
+
+            // 全屏放大补环 (一键自动取景 → 全屏等比放大 → 滚轮缩放/拖拽平移 → 窗内点击补环)
+            zoomOpen, zoomCrop, zoomScale, zoomOffset, zoomCursor, zoomHoveredRing,
+            zoomStageRef, zoomImgRef, zoomCanvasRef, zoomImgStyle, zoomStageStyle, zoomCanUse,
+            zoomScaleMin, zoomVisibleRingCount,
+            openZoomModal, closeZoomModal, resetZoomView, onZoomWheel,
+            onZoomMouseDown, onZoomMouseMove, onZoomMouseLeave, onZoomClick, onZoomImgLoad, drawZoom,
 
             // 像素标定 (单组特征点: 表格一行 + 像素距离 3 位小数)
             calibImageA, calibImageB,

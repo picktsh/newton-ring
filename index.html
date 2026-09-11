@@ -228,11 +228,75 @@
                         </div>
                     </div>
                     <div class="image-box card">
-                        <h3>识别结果 {{originalImageRef?.naturalWidth}}x{{originalImageRef?.naturalHeight}}px</h3>
+                        <h3 style="display: flex; justify-content: space-between; align-items: center;">
+                            <span>识别结果 {{originalImageRef?.naturalWidth}}x{{originalImageRef?.naturalHeight}}px</span>
+                            <span style="display: flex; align-items: center; gap: 8px;">
+                                <!-- 观看模式: 彩色/灰度 互斥按钮 (仅作用底图, 彩色环标记与识别不受影响; 与全屏共用同一状态) -->
+                                <span v-show="resultImageSrc" style="display: inline-flex; border: 1px solid #d0d0d0; border-radius: 4px; overflow: hidden;"
+                                      title="切换底图观看模式：灰底让彩色环标记与暗纹更醒目，不影响识别结果">
+                                    <button style="padding: 4px 10px; font-size: 12px; cursor: pointer; border: none;"
+                                            :style="resultGrayscale ? 'background:#fff;color:#555;' : 'background:#667eea;color:#fff;'"
+                                            @click="resultGrayscale = false">🎨 彩色</button>
+                                    <button style="padding: 4px 10px; font-size: 12px; cursor: pointer; border: none;"
+                                            :style="resultGrayscale ? 'background:#667eea;color:#fff;' : 'background:#fff;color:#555;'"
+                                            @click="resultGrayscale = true">⬛ 灰度</button>
+                                </span>
+                                <!-- 全屏放大: 一键自动取景 (以圆心为中心、边长=2×外边界半径，涵盖全部已识别环) 并等比放大到全屏 -->
+                                <button v-show="zoomCanUse"
+                                        style="padding: 4px 12px; font-size: 12px; cursor: pointer; background: #667eea; color: white; border: none; border-radius: 4px;"
+                                        title="全屏放大识别结果图 (自动取景涵盖全部已识别环)，在弹窗里更精准地点击补环"
+                                        @click="openZoomModal">⛶ 全屏放大</button>
+                            </span>
+                        </h3>
                         <div class="image-wrapper">
-                            <img ref="resultImageRef" :src="resultImageSrc" class="preview-filter" :style="{ filter: previewFilterStyle }" alt="">
+                            <img ref="resultImageRef" :src="resultImageSrc" class="preview-filter" :style="{ filter: resultImageFilter }" alt="">
                             <canvas ref="resultCanvasRef" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;"></canvas>
                         </div>
+                    </div>
+                </div>
+
+                <!-- 全屏放大补环弹窗: 自动取景 → 等比放大 → 滚轮缩放/左键拖拽平移/左键点击补环 -->
+                <!-- ESC 与右上「关闭」退出; 不做点击空白关闭 (全屏下几乎没有露出的遮罩，却多一条误触路径) -->
+                <div v-if="zoomOpen" style="position: fixed; inset: 0; z-index: 9998; background: #000; display: flex; flex-direction: column;">
+                    <!-- 顶部工具条: 取景范围 / 绝对倍率 / 视野内环数 / 复位与关闭 -->
+                    <div style="flex: 0 0 auto; display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding: 8px 14px; background: #1e1e1e; color: #ddd; font-size: 12px;">
+                        <b style="font-size: 14px;">⛶ 全屏放大补环</b>
+                        <!-- 观看模式: 与主视图共用 resultGrayscale, 切一处两处同步 -->
+                        <span style="display: inline-flex; border: 1px solid #555; border-radius: 4px; overflow: hidden;"
+                              title="切换底图观看模式：灰底让彩色环标记与暗纹更醒目，不影响识别结果">
+                            <button style="padding: 4px 10px; font-size: 12px; cursor: pointer; border: none;"
+                                    :style="resultGrayscale ? 'background:#2a2a2a;color:#bbb;' : 'background:#667eea;color:#fff;'"
+                                    @click="resultGrayscale = false">🎨 彩色</button>
+                            <button style="padding: 4px 10px; font-size: 12px; cursor: pointer; border: none;"
+                                    :style="resultGrayscale ? 'background:#667eea;color:#fff;' : 'background:#2a2a2a;color:#bbb;'"
+                                    @click="resultGrayscale = true">⬛ 灰度</button>
+                        </span>
+                        <span v-if="zoomCrop">取景 {{ zoomCrop.w }}×{{ zoomCrop.h }}px</span>
+                        <span>倍率 <b style="color: #4ec9ff;">{{ zoomScale.toFixed(2) }}x</b> (屏幕px/原图px)</span>
+                        <span>视野内 <b style="color: #4ec9ff;">{{ zoomVisibleRingCount }}</b> / {{ ringList.length }} 环<span v-if="manualRingCount"> (人工补 {{ manualRingCount }})</span></span>
+                        <span style="color: #888;">滚轮缩放 · 左键拖拽平移 · +/− 缩放 · 方向键平移 (Shift 加速) · 左键点击补环</span>
+                        <button style="margin-left: auto; padding: 4px 12px; font-size: 12px; cursor: pointer; background: #667eea; color: white; border: none; border-radius: 4px;"
+                                title="回到初始全览视野 (涵盖全部已识别环)" @click="resetZoomView">⤢ 复位全览</button>
+                        <button style="padding: 4px 12px; font-size: 12px; cursor: pointer; background: #e74c3c; color: white; border: none; border-radius: 4px;"
+                                @click="closeZoomModal">✖ 关闭 (ESC)</button>
+                    </div>
+                    <!-- 视口: 底图 img 与标记 canvas 叠放，鼠标事件全挂在视口上 (缩小时底图未必铺满视口) -->
+                    <div ref="zoomStageRef" :style="zoomStageStyle"
+                         style="position: relative; flex: 1 1 auto; min-height: 0; overflow: hidden; background: #111;"
+                         @mousedown="onZoomMouseDown" @mousemove="onZoomMouseMove" @mouseleave="onZoomMouseLeave"
+                         @click="onZoomClick" @wheel.prevent="onZoomWheel">
+                        <img ref="zoomImgRef" :src="resultImageSrc" alt="" draggable="false" @dragstart.prevent
+                             :style="[zoomImgStyle, { filter: resultImageFilter }]" @load="onZoomImgLoad">
+                        <canvas ref="zoomCanvasRef" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;"></canvas>
+                    </div>
+                    <!-- 底部读数栏: 原图坐标与半径 (补环只取决于这个半径，切向点偏不影响结果) -->
+                    <div style="flex: 0 0 auto; padding: 6px 14px; background: #1e1e1e; color: #ccc; font-size: 12px; min-height: 30px;">
+                        <span v-if="zoomCursor && zoomCursor.inside">
+                            原图坐标 ({{ zoomCursor.x.toFixed(1) }}, {{ zoomCursor.y.toFixed(1) }}) · 半径 r = <b style="color: #4ec9ff;">{{ zoomCursor.r.toFixed(1) }}</b> px · 点击即在此半径补一个环
+                            <span v-if="zoomHoveredRing"> · 指针正压在 <b>环 {{ zoomHoveredRing }}</b> 上</span>
+                        </span>
+                        <span v-else-if="zoomCursor" style="color: #e67e22;">指针在图像范围外，此处点击不会补环</span>
+                        <span v-else style="color: #888;">移动鼠标查看原图坐标与半径；青色实线圆 = 这一点下去环会落在的位置，橙色十字 = 圆心，虚线圈 = 人工补入的环</span>
                     </div>
                 </div>
 
@@ -379,8 +443,8 @@
                                                style="width: 70px; padding: 4px; border: 1px solid #ccc; border-radius: 3px; text-align: center;">
                                         <span v-if="item.manual" title="手动补入" style="color: #f39c12;">✍</span>
                                     </td>
-                                    <td>{{ (item.avgRadius * 2).toFixed(2) }}</td>
-                                    <td>{{ (item.avgRadius * 2 * pixelScale).toFixed(3) }}</td>
+                                    <td>{{ (ringRadius(item) * 2).toFixed(2) }}</td>
+                                    <td>{{ (ringRadius(item) * 2 * pixelScale).toFixed(3) }}</td>
                                 </tr>
                             </tbody>
                         </table>

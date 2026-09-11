@@ -543,7 +543,19 @@ function findMinimaDirect(profile, maxRadius) {
     const minContrast = 15;
 
     if (contrast > minContrast) {
-      minima.push({ radius: r, contrast, intensity: current });
+      // 抛物线亚像素精修: 用谷底相邻三点 (i-1, i, i+1) 的平滑强度拟合抛物线, 顶点即暗环真实半径 (亚像素)。
+      // 采样步长 0.5px 会把谷底量化到 0.5 的倍数 (对称环凑成整数 → 直径 .00 假精度),
+      // 抛物线顶点能恢复出如 189.23 这样的亚像素半径; 椭圆拟合到整数点救不回这个精度, 必须在源头修。
+      let subR = r;
+      const y0 = profile[i - 1].smoothedIntensity;
+      const y1 = profile[i].smoothedIntensity;
+      const y2 = profile[i + 1].smoothedIntensity;
+      const denom = y0 - 2 * y1 + y2;   // 谷底处二阶差分 > 0
+      if (Math.abs(denom) > 1e-6) {
+        const p = 0.5 * (y0 - y2) / denom;   // 顶点相对中心的偏移 (单位: 采样索引步)
+        if (Math.abs(p) < 1) subR = r + p * 0.5;   // 索引步 = 0.5px; |p|<1 才可信, 否则保留原值
+      }
+      minima.push({ radius: subR, contrast, intensity: current });
     }
   }
 
@@ -687,17 +699,23 @@ function extractRingData(grayMat, centerX, centerY, radius) {
     }
 
     if (points.length < 8) return null;
-    // 找上下左右4个关键点
+    // 找上下左右4个关键点 (整数坐标, 仅作回退与绘制用)
     const keyPoints = findKeyPoints(points);
+    // 椭圆拟合 (亚像素): 对全部 72 个采样点做最小二乘, 长短轴是浮点亚像素值,
+    // 比「4 个整数关键点距离平均」精度高一个量级, 且对噪声/不够圆的环更鲁棒
+    const ellipse = fitEllipse(points);
 
-    const avgRadius = (
+    // 直径精度来源: 优先椭圆长短半轴均值 (亚像素); 椭圆失败/退化时回退整数关键点平均
+    const keyPointRadius = (
       distance(keyPoints.top, { x: centerX, y: centerY }) +
       distance(keyPoints.bottom, { x: centerX, y: centerY }) +
       distance(keyPoints.left, { x: centerX, y: centerY }) +
       distance(keyPoints.right, { x: centerX, y: centerY })
     ) / 4;
-    // 椭圆拟合
-    const ellipse = fitEllipse(points);
+    const ellipseRadius = (ellipse && ellipse.size.width > 0 && ellipse.size.height > 0)
+      ? (ellipse.size.width + ellipse.size.height) / 4
+      : null;
+    const avgRadius = ellipseRadius !== null ? ellipseRadius : keyPointRadius;
 
     return {
       x: centerX,

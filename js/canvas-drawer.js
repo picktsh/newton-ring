@@ -75,7 +75,10 @@ export function drawCenterOverlay(canvasRef, center, width, height, arm = 24) {
 }
 
 // 绘制暗环覆盖层 (包括中心十字、轮廓、标签)
-export function drawOverlay(ctx, rings, hoveredRing) {
+// unit: 线宽/字号/虚线间隔/关键点半径的补偿系数，默认 1 (主视图直接绘制)。
+//       全屏放大弹窗用 ctx.setTransform(scale,...) 把绘制坐标缩放到原图像素空间，
+//       传 1/scale 可让标记保持恒定屏幕粗细而不被 scale 放大。
+export function drawOverlay(ctx, rings, hoveredRing, unit = 1) {
     if (!rings || rings.length === 0) return;
     const hasHover = hoveredRing !== null;
     // 计算所有暗环的中心点
@@ -89,7 +92,7 @@ export function drawOverlay(ctx, rings, hoveredRing) {
         return `hsla(${hue}, 100%, 60%, ${alpha})`;
     };
     // 中心十字: 白+深描边(先黑后白)，在牛顿环较亮的中心也始终清晰 (不再用绿色)
-    const crossSize = 20;
+    const crossSize = 20 * unit;
     const strokeCross = () => {
         ctx.beginPath();
         ctx.moveTo(centerX - crossSize, centerY);
@@ -98,36 +101,40 @@ export function drawOverlay(ctx, rings, hoveredRing) {
         ctx.lineTo(centerX, centerY + crossSize);
         ctx.stroke();
     };
-    ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(0, 0, 0, 0.8)'; strokeCross();
-    ctx.lineWidth = 2; ctx.strokeStyle = `rgba(255, 255, 255, ${hasHover && hoveredRing ? 1 : 0.9})`; strokeCross();
+    ctx.lineWidth = 4 * unit; ctx.strokeStyle = 'rgba(0, 0, 0, 0.8)'; strokeCross();
+    ctx.lineWidth = 2 * unit; ctx.strokeStyle = `rgba(255, 255, 255, ${hasHover && hoveredRing ? 1 : 0.9})`; strokeCross();
     // 绘制每个暗环 (轮廓/编号标签/关键点均取该环渐变色)
     rings.forEach((ring, i) => {
         const isHovered = hoveredRing === ring.number;
         const color = ringColorAt(i, 1);   // 满不透明: 常态即最亮，悬停靠更粗线宽+标签加粗区分
+        // 人工补入的环画虚线 (自动识别的环实线): 虚线专属于人工产物，一眼分辨哪圈是自己补的，
+        // 也避免在同一半径上重复补环; 颜色仍按半径序取渐变，不破坏「内红→外紫」的序号对应
+        ctx.setLineDash(ring.manual ? [10 * unit, 6 * unit] : []);
         if (ring.contour) {
-            drawContour(ctx, ring, color, isHovered);
+            drawContour(ctx, ring, color, isHovered, unit);
         } else if (ring.ellipse) {
-            drawEllipse(ctx, ring, color, isHovered);
+            drawEllipse(ctx, ring, color, isHovered, unit);
         } else if (ring.keyPoints) {
-            drawKeyPointsShape(ctx, ring, color, isHovered);
+            drawKeyPointsShape(ctx, ring, color, isHovered, unit);
         } else {
             ctx.strokeStyle = color;
-            ctx.lineWidth = isHovered ? 3.5 : 2.5;
+            ctx.lineWidth = (isHovered ? 3.5 : 2.5) * unit;
             ctx.beginPath();
             ctx.arc(ring.x, ring.y, ring.avgRadius, 0, Math.PI * 2);
             ctx.stroke();
         }
+        ctx.setLineDash([]);
         // 悬停时只显示当前环的标签 (序号统一白字黑底，不随环渐变色)
         if (!hasHover || isHovered) {
-            drawLabel(ctx, ring, isHovered);
+            drawLabel(ctx, ring, isHovered, unit);
         }
     });
 }
 
 // 绘制完整轮廓 (从 contour 数据)
-function drawContour(ctx, ring, color, isHovered) {
+function drawContour(ctx, ring, color, isHovered, unit = 1) {
     ctx.strokeStyle = color;
-    ctx.lineWidth = isHovered ? 3.5 : 2.5;
+    ctx.lineWidth = (isHovered ? 3.5 : 2.5) * unit;
     ctx.beginPath();
     const points = ring.contour?.data32S;
     if (!points || points.length === 0) return;
@@ -145,10 +152,10 @@ function drawContour(ctx, ring, color, isHovered) {
 }
 
 // 绘制椭圆 (从 ellipse 数据)
-function drawEllipse(ctx, ring, color, isHovered) {
+function drawEllipse(ctx, ring, color, isHovered, unit = 1) {
     const { center, size, angle } = ring.ellipse;
     ctx.strokeStyle = color;
-    ctx.lineWidth = isHovered ? 3.5 : 2.5;
+    ctx.lineWidth = (isHovered ? 3.5 : 2.5) * unit;
     ctx.save();
     ctx.translate(center.x, center.y);
     ctx.rotate(angle * Math.PI / 180);
@@ -159,10 +166,10 @@ function drawEllipse(ctx, ring, color, isHovered) {
 }
 
 // 绘制关键点连线形状 (上下左右4点构成的四边形)
-function drawKeyPointsShape(ctx, ring, color, isHovered) {
+function drawKeyPointsShape(ctx, ring, color, isHovered, unit = 1) {
     const { top, bottom, left, right } = ring.keyPoints;
     ctx.strokeStyle = color;
-    ctx.lineWidth = isHovered ? 3.5 : 2.5;
+    ctx.lineWidth = (isHovered ? 3.5 : 2.5) * unit;
     ctx.beginPath();
     ctx.moveTo(top.x, top.y);
     ctx.lineTo(right.x, right.y);
@@ -174,18 +181,18 @@ function drawKeyPointsShape(ctx, ring, color, isHovered) {
     ctx.fillStyle = color;
     [top, bottom, left, right].forEach(point => {
         ctx.beginPath();
-        ctx.arc(point.x, point.y, 3, 0, Math.PI * 2);
+        ctx.arc(point.x, point.y, 3 * unit, 0, Math.PI * 2);
         ctx.fill();
     });
 }
 
 // 绘制环编号标签 (位于环的左上角)：序号统一白字 + 不透明黑底，与彩色环解耦，高对比、肉眼易读
-function drawLabel(ctx, ring, isHovered) {
+function drawLabel(ctx, ring, isHovered, unit = 1) {
     const angle = -Math.PI / 4;
     const labelX = ring.x + ring.avgRadius * Math.cos(angle);
     const labelY = ring.y + ring.avgRadius * Math.sin(angle);
-    const fontSize = 15;   // 略放大 (原 12px)，肉眼更好认
-    const padding = 3;
+    const fontSize = 15 * unit;   // 略放大 (原 12px)，肉眼更好认
+    const padding = 3 * unit;
     ctx.font = `${isHovered ? 'bold ' : ''}${fontSize}px Arial`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
