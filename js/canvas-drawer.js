@@ -1,5 +1,3 @@
-import { RING_COLOR } from './constants.js';
-
 // 清空 Canvas 画布
 export function clearCanvas(canvas) {
     if (!canvas) return;
@@ -83,45 +81,53 @@ export function drawOverlay(ctx, rings, hoveredRing) {
     // 计算所有暗环的中心点
     const centerX = rings.reduce((sum, r) => sum + r.x, 0) / rings.length;
     const centerY = rings.reduce((sum, r) => sum + r.y, 0) / rings.length;
-    ctx.strokeStyle = `rgba(${RING_COLOR}, ${hasHover && hoveredRing ? 1 : 0.5})`;
-    ctx.lineWidth = 2;
+    // 环彩色渐变: rings 已按半径升序(内→外)，按可见序号把色相从 0°(红) 线性铺到 280°(蓝紫)，
+    // 每圈颜色不同; 单环取红(避免除零)。亮度 L=60% 提亮、满不透明(alpha=1)，肉眼更醒目。
+    const N = rings.length;
+    const ringColorAt = (i, alpha) => {
+        const hue = N > 1 ? Math.round(280 * i / (N - 1)) : 0;
+        return `hsla(${hue}, 100%, 60%, ${alpha})`;
+    };
+    // 中心十字: 白+深描边(先黑后白)，在牛顿环较亮的中心也始终清晰 (不再用绿色)
     const crossSize = 20;
-    ctx.beginPath();
-    ctx.moveTo(centerX - crossSize, centerY);
-    ctx.lineTo(centerX + crossSize, centerY);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(centerX, centerY - crossSize);
-    ctx.lineTo(centerX, centerY + crossSize);
-    ctx.stroke();
-    // 绘制每个暗环
-    rings.forEach((ring) => {
+    const strokeCross = () => {
+        ctx.beginPath();
+        ctx.moveTo(centerX - crossSize, centerY);
+        ctx.lineTo(centerX + crossSize, centerY);
+        ctx.moveTo(centerX, centerY - crossSize);
+        ctx.lineTo(centerX, centerY + crossSize);
+        ctx.stroke();
+    };
+    ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(0, 0, 0, 0.8)'; strokeCross();
+    ctx.lineWidth = 2; ctx.strokeStyle = `rgba(255, 255, 255, ${hasHover && hoveredRing ? 1 : 0.9})`; strokeCross();
+    // 绘制每个暗环 (轮廓/编号标签/关键点均取该环渐变色)
+    rings.forEach((ring, i) => {
         const isHovered = hoveredRing === ring.number;
-        const opacity = isHovered ? 1 : 0.7;
+        const color = ringColorAt(i, 1);   // 满不透明: 常态即最亮，悬停靠更粗线宽+标签加粗区分
         if (ring.contour) {
-            drawContour(ctx, ring, isHovered, opacity);
+            drawContour(ctx, ring, color, isHovered);
         } else if (ring.ellipse) {
-            drawEllipse(ctx, ring, isHovered, opacity);
+            drawEllipse(ctx, ring, color, isHovered);
         } else if (ring.keyPoints) {
-            drawKeyPointsShape(ctx, ring, isHovered, opacity);
+            drawKeyPointsShape(ctx, ring, color, isHovered);
         } else {
-            ctx.strokeStyle = `rgba(${RING_COLOR}, ${opacity})`;
-            ctx.lineWidth = isHovered ? 3 : 2;
+            ctx.strokeStyle = color;
+            ctx.lineWidth = isHovered ? 3.5 : 2.5;
             ctx.beginPath();
             ctx.arc(ring.x, ring.y, ring.avgRadius, 0, Math.PI * 2);
             ctx.stroke();
         }
-        // 悬停时只显示当前环的标签
+        // 悬停时只显示当前环的标签 (序号统一白字黑底，不随环渐变色)
         if (!hasHover || isHovered) {
-            drawLabel(ctx, ring, isHovered, opacity);
+            drawLabel(ctx, ring, isHovered);
         }
     });
 }
 
 // 绘制完整轮廓 (从 contour 数据)
-function drawContour(ctx, ring, isHovered, opacity) {
-    ctx.strokeStyle = `rgba(${RING_COLOR}, ${opacity})`;
-    ctx.lineWidth = isHovered ? 3 : 2;
+function drawContour(ctx, ring, color, isHovered) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = isHovered ? 3.5 : 2.5;
     ctx.beginPath();
     const points = ring.contour?.data32S;
     if (!points || points.length === 0) return;
@@ -139,10 +145,10 @@ function drawContour(ctx, ring, isHovered, opacity) {
 }
 
 // 绘制椭圆 (从 ellipse 数据)
-function drawEllipse(ctx, ring, isHovered, opacity) {
+function drawEllipse(ctx, ring, color, isHovered) {
     const { center, size, angle } = ring.ellipse;
-    ctx.strokeStyle = `rgba(${RING_COLOR}, ${opacity})`;
-    ctx.lineWidth = isHovered ? 3 : 2;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = isHovered ? 3.5 : 2.5;
     ctx.save();
     ctx.translate(center.x, center.y);
     ctx.rotate(angle * Math.PI / 180);
@@ -153,10 +159,10 @@ function drawEllipse(ctx, ring, isHovered, opacity) {
 }
 
 // 绘制关键点连线形状 (上下左右4点构成的四边形)
-function drawKeyPointsShape(ctx, ring, isHovered, opacity) {
+function drawKeyPointsShape(ctx, ring, color, isHovered) {
     const { top, bottom, left, right } = ring.keyPoints;
-    ctx.strokeStyle = `rgba(${RING_COLOR}, ${opacity})`;
-    ctx.lineWidth = isHovered ? 3 : 2;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = isHovered ? 3.5 : 2.5;
     ctx.beginPath();
     ctx.moveTo(top.x, top.y);
     ctx.lineTo(right.x, right.y);
@@ -165,7 +171,7 @@ function drawKeyPointsShape(ctx, ring, isHovered, opacity) {
     ctx.closePath();
     ctx.stroke();
     // 标记4个关键点
-    ctx.fillStyle = `rgba(${RING_COLOR}, ${opacity})`;
+    ctx.fillStyle = color;
     [top, bottom, left, right].forEach(point => {
         ctx.beginPath();
         ctx.arc(point.x, point.y, 3, 0, Math.PI * 2);
@@ -173,24 +179,27 @@ function drawKeyPointsShape(ctx, ring, isHovered, opacity) {
     });
 }
 
-// 绘制环编号标签 (位于环的左上角)
-function drawLabel(ctx, ring, isHovered, opacity) {
+// 绘制环编号标签 (位于环的左上角)：序号统一白字 + 不透明黑底，与彩色环解耦，高对比、肉眼易读
+function drawLabel(ctx, ring, isHovered) {
     const angle = -Math.PI / 4;
     const labelX = ring.x + ring.avgRadius * Math.cos(angle);
     const labelY = ring.y + ring.avgRadius * Math.sin(angle);
-    ctx.font = `${isHovered ? 'bold' : ''} 12px Arial`;
+    const fontSize = 15;   // 略放大 (原 12px)，肉眼更好认
+    const padding = 3;
+    ctx.font = `${isHovered ? 'bold ' : ''}${fontSize}px Arial`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     const text = ring.number.toString();
     const textMetrics = ctx.measureText(text);
-    const padding = 2;
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+    // 底色: 不透明黑 (0.85)，尺寸随字号自适应 (不再写死 12px 高，避免大字被裁)
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
     ctx.fillRect(
         labelX - textMetrics.width / 2 - padding,
-        labelY - 6 - padding,
+        labelY - fontSize / 2 - padding,
         textMetrics.width + padding * 2,
-        12 + padding * 2
+        fontSize + padding * 2
     );
-    ctx.fillStyle = `rgba(${RING_COLOR}, ${opacity})`;
+    // 序号统一白色 (不随环渐变色)
+    ctx.fillStyle = '#fff';
     ctx.fillText(text, labelX, labelY);
 }

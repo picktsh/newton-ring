@@ -17,6 +17,7 @@
         .container { max-width: 1400px; margin: 0 auto; border-radius: 12px; box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2); overflow: hidden; }
         .content { padding: 20px; display: flex; flex-direction: column; gap: 20px; background: white; }
         .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .grid-1 { display: grid; grid-template-columns: 1fr; gap: 20px; }
         .grid-auto { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; }
 
         /* Card Component */
@@ -175,6 +176,13 @@
 
             <!-- Tab 2: 环纹识别与人机校验 -->
             <div class="content" v-show="activeTab === 'rings'">
+                <!-- 一键导入图A: 把 tab1(像素标定) 上传的图A 原图导入本页上传处, 免去重复上传; 本页仍可自己上传 -->
+                <div class="card" style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+                    <button class="btn" style="width: auto; margin: 0; padding: 8px 18px; background: linear-gradient(135deg, #16a085, #1abc9c);" :disabled="!calibOriginalA || isProcessing" @click="importCalibAToRings" title="把 tab1「像素标定」上传的图A 原图导入到本页并自动开始识别; 仍可点右侧「原始图像」框自行上传">
+                        ⬇ 一键导入图A (取自像素标定板块)
+                    </button>
+                    <span style="font-size: 12px; color: #999;">导入 tab1「像素标定」的图A 原图并自动开始识别；也可点右侧「原始图像」框自行上传</span>
+                </div>
                 <!-- Image Thumbnails -->
                 <div class="processed-images-list card" v-if="processedImages.length > 0">
                     <div
@@ -199,11 +207,14 @@
                     <div v-for="(log, index) in logs" :key="index" :class="['log-entry', `log-${log.type}`]">{{ log.message }}</div>
                 </div>
 
-                <!-- Image Display -->
-                <div class="image-container grid-2">
+                <!-- Image Display: 原始图像面板默认折叠为细标题栏, 识别结果独占整行; 展开恢复旧双栏 -->
+                <div class="image-container" :class="ringsOriginalExpanded ? 'grid-2' : 'grid-1'">
                     <div class="image-box card">
-                        <h3>原始图像</h3>
-                        <div class="image-wrapper">
+                        <h3 style="display: flex; justify-content: space-between; align-items: center;">
+                            <span>原始图像</span>
+                            <button v-show="uploadedImage" style="padding: 4px 12px; font-size: 12px; cursor: pointer; background: #667eea; color: white; border: none; border-radius: 4px;" @click="ringsShowOriginal = !ringsShowOriginal">{{ ringsShowOriginal ? '收起 ▲' : '展开 ▼' }}</button>
+                        </h3>
+                        <div class="image-wrapper" v-show="ringsOriginalExpanded">
                             <img ref="originalImageRef" :src="originalImageSrc" alt="" >
                             <div
                                 class="upload-overlay"
@@ -229,7 +240,7 @@
                 <div class="card" v-if="centerPhase === 'awaiting-center' && detectedCenter" style="border-left: 4px solid #f39c12;">
                     <h3 style="color: #333; margin-bottom: 8px;">🎯 第一步：圆心确认</h3>
                     <p style="font-size: 13px; color: #666; line-height: 1.6; margin-bottom: 10px;">
-                        已自动检测圆心，请在右侧图像中核对位置：可直接 <b>拖拽</b> 圆心、用 <b>方向键</b> 微调 (每次1px，Shift+方向键5px)，或输入精确坐标。按 <b>+/- 键</b> 可加长/减短圆心十字光标 (每次8px)，便于对准最内圈。确认无误后再进行圆环识别。
+                        已自动检测圆心，请在右侧图像中核对位置：可直接 <b>拖拽</b> 圆心、用 <b>方向键</b> 微调 (每次1px，Shift+方向键5px)，或输入精确坐标。按 <b>+/- 键</b> 可加长/减短圆心十字光标 (每次8px，Shift 加速40px；上限达图像半对角线，可对准任意大小的环)，便于对准环纹。确认无误后再进行圆环识别。
                     </p>
                     <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
                         <label style="font-size: 13px;">X:
@@ -408,9 +419,9 @@
                         </p>
                         <p v-else-if="averageRadius > 0">{{ averageRadius.toFixed(3) }} m</p>
                         <p v-else>-</p>
-                        <!-- 不确定度评定明细: 扩展不确定度 U = k·u_C (P=0.95), 相对不确定度与A/B类分量 -->
+                        <!-- 不确定度评定明细: 扩展不确定度 U = k·u_C (p=0.683, k=1), 相对不确定度与A/B类分量 -->
                         <div v-if="radiusUncertainty && radiusUncertainty.valid" style="margin-top: 10px; font-size: 12px; color: #666; line-height: 1.9; text-align: left;">
-                            <div>扩展不确定度 U = k·u<sub>C</sub>，置信概率 P = 0.95，包含因子 k = {{ radiusUncertainty.kText }}</div>
+                            <div>扩展不确定度 U = k·u<sub>C</sub>，置信概率 p = 0.683，包含因子 k = {{ radiusUncertainty.kText }}</div>
                             <div>相对不确定度 U/R = {{ radiusUncertainty.relativeText }}　（有效分组数 k = {{ radiusUncertainty.k }}）</div>
                             <div style="color: #999; margin-top: 4px; border-top: 1px dashed #ddd; padding-top: 6px;">
                                 A类 u<sub>A</sub> = {{ radiusUncertainty.uAText }} m（多组统计）　|　
@@ -423,8 +434,8 @@
                             <summary style="cursor: pointer; font-size: 12px; color: #667eea; font-weight: bold;">🔍 点开查看不确定度计算过程</summary>
                             <div style="margin-top: 8px; font-size: 12px; color: #555; line-height: 1.9; background: #f8f9fb; border: 1px solid #e3e6ee; border-radius: 6px; padding: 10px 12px;">
                                 <div style="font-weight: bold; color: #333;">1. 直径 D 的 B 类不确定度</div>
-                                <div>一次直径测量需读 2 次显微镜刻度（左、右），单次读数示值误差限 Δ = {{ radiusUncertainty.deltaInstrument }} mm，均匀分布：</div>
-                                <div style="font-family: monospace;">u_B(x) = Δ/√3 = {{ radiusUncertainty.deltaInstrument }}/√3 = {{ radiusUncertainty.uBxText }} mm</div>
+                                <div>一次直径测量需读 2 次显微镜刻度（左、右），单次读数示值误差限 Δ = {{ radiusUncertainty.deltaInstrument }} mm，按正态分布 (p = 0.683，k = 1)：</div>
+                                <div style="font-family: monospace;">u_B(x) = Δ/k = {{ radiusUncertainty.deltaInstrument }}/1 = {{ radiusUncertainty.uBxText }} mm</div>
                                 <div style="font-family: monospace;">u_B(D) = √2·u_B(x) = √2·{{ radiusUncertainty.uBxText }} ≈ {{ radiusUncertainty.uBDText }} mm</div>
                                 <div style="font-weight: bold; color: #333; margin-top: 8px;">2. R 的 B 类相对不确定度（逐组）</div>
                                 <div style="font-family: monospace;">u_B(R)/R = 2·u_B(D)/(D_m²−D_n²)·√(D_m²+D_n²)，u_B(R) = R·(u_B(R)/R)</div>
@@ -451,9 +462,9 @@
                                 <div v-else style="color: #e67e22;">k &lt; 2，无法评定 A 类（u_A = 0）。</div>
                                 <div style="font-weight: bold; color: #333; margin-top: 8px;">4. 合成标准不确定度</div>
                                 <div style="font-family: monospace;">u_C(R) = √[u_A²(R̄) + u_B²(R)] = {{ radiusUncertainty.uCText }} m</div>
-                                <div style="font-weight: bold; color: #333; margin-top: 8px;">5. 扩展不确定度（P = 0.95）</div>
-                                <div style="font-family: monospace;">ν_eff = {{ radiusUncertainty.nuEffText }}，k = t₀.₉₅(ν_eff) = {{ radiusUncertainty.kText }}</div>
-                                <div style="font-family: monospace;">U = k·u_C = {{ radiusUncertainty.uText }} m</div>
+                                <div style="font-weight: bold; color: #333; margin-top: 8px;">5. 扩展不确定度（p = 0.683，k = 1）</div>
+                                <div style="font-family: monospace;">ν_eff = {{ radiusUncertainty.nuEffText }}（自由度参考），包含因子 k = {{ radiusUncertainty.kText }}（p = 0.683）</div>
+                                <div style="font-family: monospace;">U = k·u_C = 1·u_C = {{ radiusUncertainty.uText }} m</div>
                                 <div style="font-weight: bold; color: #27ae60; margin-top: 6px;">最终结果：R = ({{ radiusUncertainty.meanText }} ± {{ radiusUncertainty.uText }}) m，U/R = {{ radiusUncertainty.relativeText }}</div>
                             </div>
                         </details>
@@ -485,7 +496,7 @@
                     <h3 style="color: #333; margin-bottom: 8px;">📏 像素标定与位移测算</h3>
                     <p style="font-size: 13px; color: #666; line-height: 1.6;">
                         通过转动测微鼓轮，先后拍摄两张显微镜视野图片。上传后先在图A上框选圆形截取区 (红圈=实际剪下的区域，两图用完全相同的位置截取)，
-                        确认后下方的对齐重叠就只用这块截取区域 (画面按圆形显示，不自动重合)，再点「一键重叠」对齐；也可跳过截取直接对齐全图 (或手动拖滑块)。
+                        确认后下方的对齐重叠就只用这块截取区域 (画面按圆形显示，不自动重合)，再拖滑块手动对齐；也可跳过截取直接对齐全图。
                         再在叠加画面上点击同一特征点，系统计算像素距离 (保留 3 位小数)。
                         输入鼓轮实际移动的物理距离，即可算出标定值（mm/像素）。
                     </p>
@@ -510,9 +521,6 @@
                         </button>
                         <button v-if="calibImageA || calibImageB" class="calibration-upload-btn" style="background: linear-gradient(135deg, #e74c3c, #c0392b);" @click="resetCalibration">
                             🔄 全部重置
-                        </button>
-                        <button v-if="calibCroppedOriginals" class="calibration-upload-btn" style="background: linear-gradient(135deg, #f39c12, #e67e22);" @click="restoreOriginalCalibImages">
-                            ↩ 恢复原图 (当前为截取图)
                         </button>
                     </div>
                     <input type="file" ref="calibFileInputA" accept="image/*" @change="handleCalibUploadA" style="display: none;">
@@ -545,15 +553,19 @@
                         </div>
                     </div>
 
-                    <!-- 圆形截取: 在图A上框选，同坐标同步应用到图B，确认后替换两图 (不自动重合) -->
-                    <div class="card" v-if="cropReady" style="flex: 1 1 480px;">
+                    <!-- 圆形截取: 常驻卡片。未截取=框选态；已截取=摘要+「重新裁剪」(恢复原图备份后回到框选态，无需重传) -->
+                    <div class="card" v-if="overlayReady" style="flex: 1 1 480px;">
+                    <!-- 框选态: 在图A(原图)上拖拽红圈框选，同坐标同步应用到图B，确认后替换两图 (不自动重合) -->
+                    <template v-if="!calibIsCropped">
                     <h3 style="color: #333; margin-bottom: 10px;">
                         ✂️ 圆形截取 (两图同位置)
-                        <span style="font-size: 12px; color: #999; margin-left: 10px;">在图A上拖拽红色圆圈选择截取范围 (红圈即实际剪下的区域)，图B自动使用完全相同的圆心与半径；确认后下方对齐重叠只用这块区域 (不自动重合)</span>
+                        <span style="font-size: 12px; color: #999; margin-left: 10px;">在图A上拖拽红色圆圈选择截取范围 (拖圆内移位置、拖圆周右侧红手柄改半径，红圈即实际剪下的区域)，图B自动使用完全相同的圆心与半径；确认后下方对齐重叠只用这块区域 (不自动重合)</span>
                     </h3>
                     <div ref="cropStageRef" class="crop-stage" tabindex="0" @mousedown="onCropMouseDown" @keydown="onCropKeydown" style="position: relative; display: inline-block; max-width: 100%; overflow: hidden; cursor: move; user-select: none; line-height: 0;">
                         <img ref="cropBaseImgRef" :src="calibImageA.src" @load="updateDisplayScales" alt="图A (截取基准)" style="display: block; max-width: 100%; height: auto;">
                         <div :style="cropCircleStyle"></div>
+                        <!-- 拖拽改半径手柄: 圆周 3 点钟红点, mousedown.stop 阻止冒泡到 stage 的移圆心处理 -->
+                        <div :style="cropHandleStyle" @mousedown.stop="onCropResizeStart" title="拖拽调整截取半径"></div>
                     </div>
                     <div style="display: flex; align-items: center; gap: 12px; margin-top: 12px; flex-wrap: wrap;">
                         <button class="calibration-upload-btn" style="background: linear-gradient(135deg, #e67e22, #f39c12);" @click="adjustCropRadiusMinus" title="等效键盘 − 键">－ 缩小</button>
@@ -567,49 +579,66 @@
                     </div>
                     <div v-if="cropMsg" style="margin-top: 8px; font-size: 13px; color: #667eea; font-weight: bold;">{{ cropMsg }}</div>
                     <div class="calibration-hint">
-                        💡 拖动红色圆圈把截取范围对准要重叠的环纹区域，半径三种方式任选: 拖 <b>滑块</b>、点 <b>－/＋</b> 按钮、或按键盘 <b>+/−</b> (Shift 加速 ±50px，在截取画面上还能用 <b>方向键</b> 移圆心、<b>Home</b> 复位)。半径范围 20px ~ 短边一半；圆靠边时会自动把圆心往回推而不会强行压小半径。红圈按「占原图的百分比」定位，<b>圈到哪就剪到哪</b>，上方读数即实际截取的像素范围。
-                        点 <b>确认截取</b> 后，两图按完全相同的位置剪下同一块方形区域 (不会自动重合)，下方叠加画面按 <b>圆形</b> 显示它 (内切圆就是你框选的那个圆)，再点 <b>一键重叠</b> 或拖滑块对齐。
+                        💡 拖动红色圆圈把截取范围对准要重叠的环纹区域，半径四种方式任选: <b>直接拖圆周右侧的红色手柄</b>、拖 <b>滑块</b>、点 <b>－/＋</b> 按钮、或按键盘 <b>+/−</b> (Shift 加速 ±50px，在截取画面上还能用 <b>方向键</b> 移圆心、<b>Home</b> 复位)。半径范围 20px ~ 短边一半；圆靠边时会自动把圆心往回推而不会强行压小半径。红圈按「占原图的百分比」定位，<b>圈到哪就剪到哪</b>，上方读数即实际截取的像素范围。
+                        点 <b>确认截取</b> 后，两图按完全相同的位置剪下同一块方形区域 (不会自动重合)，下方叠加画面按 <b>圆形</b> 显示它 (内切圆就是你框选的那个圆)，再拖滑块或方向键对齐。
                         之所以存方形像素而不是圆形抠图：圆形抠图圆外是透明的，算法读图时透明会被当成纯黑，那条人工圆边在两图里位置完全相同，会把对齐锁死在「偏移≈0」而环纹依旧错开。
-                        截取后如需重选区域，点上方 <b>恢复原图</b>。也可跳过本步，直接在下方叠加对齐卡片处理整图。
+                        截取后本卡片切换为「已截取」态，如需重选区域点其中的 <b>重新裁剪</b> (恢复原图、无需重传)。也可跳过本步，直接在下方叠加对齐卡片处理整图。
                     </div>
+                    </template>
+                    <!-- 已截取态: 显示截取结果摘要 + 重新裁剪入口 (机制同原「恢复原图」，合并为一个按钮) -->
+                    <template v-else>
+                    <h3 style="color: #333; margin-bottom: 10px;">
+                        ✂️ 圆形截取 (两图同位置)
+                        <span style="font-size: 12px; color: #999; margin-left: 10px;">当前为截取图，下方叠加对齐与取点均基于此截取区域</span>
+                    </h3>
+                    <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+                        <span style="font-size: 13px; color: #27ae60; font-weight: bold;">✅ 已截取 ({{ calibImageA.width }}×{{ calibImageA.height }}px)</span>
+                        <button v-if="calibCroppedOriginals" class="calibration-upload-btn" style="background: linear-gradient(135deg, #f39c12, #e67e22);" @click="reCrop" title="恢复原图并沿用上次截取范围，重新框选后再次确认截取；无需重新上传图A/B">
+                            🔄 重新裁剪 / 恢复原图
+                        </button>
+                        <span v-else style="font-size: 12px; color: #999;">刷新后无原图备份，如需重裁请重新上传图A/B</span>
+                    </div>
+                    <div v-if="cropMsg" style="margin-top: 8px; font-size: 13px; color: #667eea; font-weight: bold;">{{ cropMsg }}</div>
+                    <div class="calibration-hint">
+                        💡 点 <b>重新裁剪</b> 会恢复到截取前的原图 (无需重新上传)，并沿用上次截取的圆心/半径作为起点，重新框选后再点 <b>确认截取</b> 即可；若已锁定对齐或已取特征点会先弹确认 (重裁会清空这些且不可撤销)。也可直接滚到下方用整图叠加对齐。
+                    </div>
+                    </template>
                 </div>
                 </div>
 
                 <!-- 叠加对齐 (粗对齐 + 精细对齐) -->
                 <div class="card" v-if="calibImageA && calibImageB">
                     <h3 style="color: #333; margin-bottom: 10px;">
-                        🔍 叠加对齐 (一键重叠 / 手动粗对齐 + 精细对齐)
-                        <span style="font-size: 12px; color: #999; margin-left: 10px;">当前操作对象: {{ calibIsCropped ? '截取图' : '原始图' }}。图A固定，图B半透明叠加，点「一键重叠」自动对齐重复部分，或拖动滑块/方向键手动对齐</span>
+                        🔍 叠加对齐 (手动粗对齐 + 精细对齐)
+                        <span style="font-size: 12px; color: #999; margin-left: 10px;">当前操作对象: {{ calibIsCropped ? '截取图' : '原始图' }}。图A固定，图B半透明叠加，拖动滑块/方向键手动对齐 (可开「闪烁对比」判读错位)</span>
                     </h3>
                     <div v-if="overlaySizeMismatch" class="calibration-hint" style="background: #fdecea; color: #c0392b;">
                         ⚠️ 两张图片尺寸不一致，无法叠加对齐。请使用同一机位拍摄的两张图片。
                     </div>
                     <template v-else>
-                        <!-- 显示模式按钮组: 彩色叠加 / 灰度叠加 / 差值模式 (均为纯显示层变换，不改变图片像素) -->
+                        <!-- 显示模式按钮组: 彩色叠加 / 灰度叠加 (均为纯显示层变换，不改变图片像素) -->
                         <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap;">
                             <span style="font-size: 12px; color: #666;">观察模式:</span>
                             <button class="calibration-upload-btn" style="padding: 5px 12px; font-size: 12px;" :style="{ background: overlayBlendMode === 'overlay' ? 'linear-gradient(135deg, #667eea, #764ba2)' : '#c8ccd4' }" @click="overlayBlendMode = 'overlay'">🌈 彩色叠加</button>
                             <button class="calibration-upload-btn" style="padding: 5px 12px; font-size: 12px;" :style="{ background: overlayBlendMode === 'gray' ? 'linear-gradient(135deg, #667eea, #764ba2)' : '#c8ccd4' }" @click="overlayBlendMode = 'gray'">⬜ 灰度叠加</button>
-                            <button class="calibration-upload-btn" style="padding: 5px 12px; font-size: 12px;" :style="{ background: overlayBlendMode === 'difference' ? 'linear-gradient(135deg, #667eea, #764ba2)' : '#c8ccd4' }" @click="overlayBlendMode = 'difference'">⬛ 差值模式</button>
                             <span style="font-size: 11px; color: #999;">{{ overlayModeHint }}</span>
                         </div>
-                        <!-- 叠加画面: 图A底图固定，图B按偏移叠加 (或画布差值合成)，精细对齐完成后可点击取点 -->
-                        <div class="overlay-stage" ref="overlayStageRef" @click="onOverlayClick" :style="overlayStageStyle">
-                            <img :src="calibImageA.src" ref="overlayBaseImgRef" @load="onOverlayImgLoad" :style="{ filter: overlayBlendMode === 'gray' ? 'grayscale(1)' : 'none' }" alt="图A (底图)">
+                        <!-- 叠加画面: 图A底图固定，图B按偏移叠加，对齐锁定后可点击取点 -->
+                        <div class="overlay-stage" ref="overlayStageRef" @click="onOverlayClick" @mousedown="onGuideMouseDown" :style="overlayStageStyle">
+                            <img :src="calibImageA.src" ref="overlayBaseImgRef" @load="onOverlayImgLoad" :style="overlayImgAStyle" alt="图A (底图)">
                             <img :src="calibImageB.src" ref="overlayBImgRef" @load="onOverlayImgLoad" :style="overlayImgBStyle" alt="图B (叠加)">
-                            <canvas v-show="overlayBlendMode === 'difference'" ref="overlayDiffCanvasRef" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;"></canvas>
                             <canvas ref="overlayCanvasRef" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;"></canvas>
                         </div>
                         <!-- X/Y 偏移滑块 -->
                         <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 12px;">
                             <div style="display: flex; align-items: center; gap: 10px;">
                                 <label style="width: 80px; font-size: 12px; color: #666;">水平偏移 Δx</label>
-                                <input type="range" style="flex: 1;" :min="-overlayMaxX" :max="overlayMaxX" step="1" v-model.number="overlayDx" @input="onOverlayOffsetInput">
+                                <input type="range" style="flex: 1;" :min="-overlayMaxX" :max="overlayMaxX" step="1" v-model.number="overlayDx" :disabled="overlayLocked" @input="onOverlayOffsetInput">
                                 <span style="width: 70px; text-align: right; font-family: monospace; font-size: 12px;">{{ overlayDxText }} px</span>
                             </div>
                             <div style="display: flex; align-items: center; gap: 10px;">
                                 <label style="width: 80px; font-size: 12px; color: #666;">垂直偏移 Δy</label>
-                                <input type="range" style="flex: 1;" :min="-overlayMaxY" :max="overlayMaxY" step="1" v-model.number="overlayDy" @input="onOverlayOffsetInput">
+                                <input type="range" style="flex: 1;" :min="-overlayMaxY" :max="overlayMaxY" step="1" v-model.number="overlayDy" :disabled="overlayLocked" @input="onOverlayOffsetInput">
                                 <span style="width: 70px; text-align: right; font-family: monospace; font-size: 12px;">{{ overlayDyText }} px</span>
                             </div>
                         </div>
@@ -621,31 +650,61 @@
                         </div>
                         <!-- 操作按钮 -->
                         <div style="display: flex; align-items: center; gap: 12px; margin-top: 12px; flex-wrap: wrap;">
-                            <button class="calibration-upload-btn" style="background: linear-gradient(135deg, #667eea, #764ba2);" :disabled="overlayMatchBusy || overlayFineBusy || overlayCheckBusy || !cvReady" @click="runOverlayOneClickAlign">
-                                {{ overlayMatchBusy ? '⏳ 重叠中…' : '🪄 一键重叠' }}
+                            <button class="calibration-upload-btn" style="background: #95a5a6;" :disabled="overlayLocked" @click="resetOverlayShift">↺ 一键复位</button>
+                            <!-- 闪烁对比: 两图透明度 50%/100% 主次交替硬切，错位处跳动、对齐后跳动消失; 锁定/配准进行中灰掉 -->
+                            <button class="calibration-upload-btn" :style="{ background: overlayBlinkOn ? 'linear-gradient(135deg, #e67e22, #f39c12)' : 'linear-gradient(135deg, #16a085, #1abc9c)' }" :disabled="overlayLocked || overlayFineBusy || overlayCheckBusy || !overlayReady" @click="toggleOverlayBlink">
+                                {{ overlayBlinkOn ? '⏸ 停止闪烁' : '👁 闪烁对比' }}
                             </button>
-                            <button class="calibration-upload-btn" style="background: #95a5a6;" @click="resetOverlayShift">↺ 一键复位</button>
-                            <button class="calibration-upload-btn" style="background: linear-gradient(135deg, #2980b9, #667eea);" :disabled="overlayMatchBusy || overlayCheckBusy || overlayFineBusy || !cvReady" @click="runOverlayCheck">
+                            <button class="calibration-upload-btn" style="background: linear-gradient(135deg, #2980b9, #667eea);" :disabled="overlayCheckBusy || overlayFineBusy || !cvReady" @click="runOverlayCheck">
                                 {{ overlayCheckBusy ? '⏳ 检查中…' : '🔍 检查对齐' }}
                             </button>
-                            <button class="calibration-upload-btn" style="background: linear-gradient(135deg, #27ae60, #2ecc71);" :disabled="overlayMatchBusy || overlayFineBusy || overlayCheckBusy || !cvReady" @click="runOverlayFineAlign">
+                            <button class="calibration-upload-btn" style="background: linear-gradient(135deg, #27ae60, #2ecc71);" :disabled="overlayLocked || overlayFineBusy || overlayCheckBusy || !cvReady" @click="runOverlayFineAlign">
                                 {{ overlayFineBusy ? '⏳ 微调中…' : '🔬 精细对齐' }}
                             </button>
-                            <button class="calibration-upload-btn" style="background: linear-gradient(135deg, #e74c3c, #c0392b);" :disabled="overlayAutoPickBusy || overlayMatchBusy || overlayFineBusy || overlayCheckBusy || !cvReady" @click="autoPickCalibPoint">
-                                {{ overlayAutoPickBusy ? '⏳ 取点中…' : '🎯 自动取点 (测量移动像素距离)' }}
+                            <button class="calibration-upload-btn" :style="{ background: overlayLocked ? 'linear-gradient(135deg, #e67e22, #f39c12)' : 'linear-gradient(135deg, #16a085, #1abc9c)' }" :disabled="!overlayReady || overlayFineBusy || overlayCheckBusy" @click="toggleOverlayLock">
+                                {{ overlayLocked ? '🔓 解锁对齐' : '🔒 确定对齐' }}
                             </button>
-                            <span v-if="overlayFineDone" style="font-size: 12px; color: #27ae60;">✔ 精细对齐完成，可点「自动取点」直接填表，或点击叠加画面手动取点</span>
-                            <span v-else-if="overlayMatchBusy" style="font-size: 12px; color: #8e44ad;">⏳ 正在自动重叠两图重复部分…</span>
-                            <span v-else style="font-size: 12px; color: #999;">推荐先点「一键重叠」自动对齐；手动拖滑块时点「检查对齐」确认</span>
+                            <span v-if="overlayLocked" style="font-size: 18px; line-height: 1;" title="对齐已锁定：两图位置固定，点击叠加画面即可手动取点">🔒</span>
+                            <span v-if="overlayLocked" style="font-size: 12px; color: #27ae60;">已锁定，点击叠加画面任意位置即可手动取点 (每次新增一组)</span>
+                            <span v-else-if="overlayBlinkOn" style="font-size: 12px; color: #e67e22;">⚡ 闪烁对比中: 两图透明度交替 (600ms/相位)，可直接拖滑块/方向键移动图B；再按一次停止</span>
+                            <span v-else style="font-size: 12px; color: #999;">推荐拖滑块/方向键粗对齐并参考重合度残差；对齐满意后点「确定对齐」锁定再取点</span>
                         </div>
                         <!-- 精细对齐状态/结果直接显示在卡片内 (标定页无日志面板) -->
                         <div v-if="overlayFineMsg" :style="overlayFineMsgStyle">{{ overlayFineMsg }}</div>
                         <div class="calibration-hint">
-                            💡 <b>推荐流程</b>：上传两图后直接点 <b>一键重叠</b>——系统自动找到两图共同的环纹区域并叠合 (圆心拟合→模板匹配→ORB 三级级联，两三百像素的大偏移也能自动识别)，随后自动接精细对齐取亚像素精度。
+                            💡 <b>推荐流程</b>：上传两图后先 <b>手动粗对齐</b>——拖动滑块 (方向键微调, Shift+方向键=5px)，同时参考 <b>重合度残差</b> 把数值调到最小；可开 <b>闪烁对比</b> 辅助判读：两图透明度交替闪动，没对齐的环纹会明显跳动、对齐后跳动消失 (闪烁中照样能拖滑块/按方向键移动图B，再按一次停止)。
                             环纹具有自相似性，肉眼可能在多个位置都"看似重叠"，请以 <b>重合度残差</b> (越小=越准) 与 <b>检查对齐</b> (权威结论+偏差方向+圆心标记) 为准。
-                            也可手动拖滑块 (方向键微调, Shift+方向键=5px；建议切 <b>差值模式</b> 把画面调到最暗)，再点 <b>精细对齐</b> 收尾。精细对齐完成后，点 <b>自动取点 (测量移动像素距离)</b> 一键直接得到表格该行全部数据 (无需点击画面)；也可在叠加画面上点击同一特征点手动取点。
+                            粗对齐接近后点 <b>精细对齐</b> 收尾 (取亚像素精度)。对齐满意后点 <b>确定对齐</b> 锁定两图位置 (按钮旁出现 🔒)，随后在叠加画面上点击特征点即可手动取点，每次点击新增一组并填入下方表格。
                         </div>
                     </template>
+                </div>
+
+                <!-- 辅助对齐圆环: 纯视觉参考环, 帮助第一轮手动粗对齐 (不参与配准/取点计算) -->
+                <div class="card" v-if="calibImageA && calibImageB && !overlaySizeMismatch">
+                    <h3 style="color: #333; margin-bottom: 10px;">
+                        ⭕ 辅助对齐圆环
+                        <span style="font-size: 12px; color: #999; margin-left: 10px;">添加可拖拽的霓虹参考环套住牛顿环, 帮助第一轮手动粗对齐 (纯视觉, 不影响配准与取点)</span>
+                    </h3>
+                    <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
+                        <button class="calibration-upload-btn" style="background: linear-gradient(135deg, #8e44ad, #9b59b6);" @click="addGuideRing">➕ 添加辅助环</button>
+                        <button v-if="guideRings.length" class="calibration-upload-btn" style="background: #e74c3c;" :disabled="!guideSelectedRing" @click="removeGuideRing(guideSelectedId)">🗑 删除选中环</button>
+                        <button v-if="guideRings.length" class="calibration-upload-btn" style="background: #95a5a6;" @click="clearGuideRings">🧹 清空全部</button>
+                        <span v-if="guideRings.length" style="font-size: 12px; color: #666; font-family: monospace;">
+                            共同圆心 ({{ Math.round(guideRings[0].x) }}, {{ Math.round(guideRings[0].y) }})<template v-if="guideSelectedRing"> · 选中环半径 {{ Math.round(guideSelectedRing.r) }} px</template>
+                        </span>
+                    </div>
+                    <!-- 环列表: 点击行切换选中 -->
+                    <div v-if="guideRings.length" style="margin-top: 10px; display: flex; flex-direction: column; gap: 4px;">
+                        <div v-for="(ring, i) in guideRings" :key="ring.id" @click="guideSelectedId = ring.id"
+                             :style="{ display: 'flex', alignItems: 'center', gap: '8px', padding: '4px 8px', borderRadius: '4px', cursor: 'pointer', border: ring.id === guideSelectedId ? '1px solid ' + guideRingColor(ring) : '1px solid transparent', background: ring.id === guideSelectedId ? '#f5f0ff' : 'transparent' }">
+                            <span :style="{ color: guideRingColor(ring), fontSize: '14px' }">●</span>
+                            <span style="font-size: 12px; font-family: monospace; color: #333;">环{{ i + 1 }} · 半径 {{ Math.round(ring.r) }}px</span>
+                            <button class="calibration-upload-btn" style="background: #e74c3c; padding: 2px 8px; font-size: 11px; margin-left: auto;" @click.stop="removeGuideRing(ring.id)">删除</button>
+                        </div>
+                    </div>
+                    <div class="calibration-hint">
+                        💡 所有辅助环<b>同心</b> (以第一环圆心为共同圆心)。拖拽用法 (在上方叠加画面上): 按住<b>任意环线条</b>拖动 = 移动共同圆心 (整组平移); 按住某环右侧<b>小圆手柄</b>拖动 = 调该环半径; 环内空白区域点击仍是取点 (不冲突)。霓虹色与灰度牛顿环明显区分, 锁定后辅助环仍可拖。
+                    </div>
                 </div>
 
                 <!-- 空状态提示 -->
@@ -655,14 +714,14 @@
                     <p style="font-size: 13px; color: #bbb;">请分别上传图A和图B，完成叠加对齐后在叠加画面上点击特征点</p>
                 </div>
 
-                <!-- 测量结果: 特征点表格 (单组一行) + 像素距离 + 标定值 -->
+                <!-- 测量结果: 特征点表格 (多组多行) + 像素距离 + 标定值 -->
                 <div class="card" v-if="calibImageA || calibImageB">
                     <h3 style="color: #333; margin-bottom: 15px;">
                         📊 测量结果
-                        <span style="font-size: 12px; color: #999; margin-left: 10px;">精细对齐完成后，点「自动取点」一键填充表格；也可在叠加画面上点击同一特征点手动取点 (每次替换上一次)</span>
+                        <span style="font-size: 12px; color: #999; margin-left: 10px;">锁定对齐后，在叠加画面上点击特征点手动取点 (每次点击新增一组一行)</span>
                     </h3>
 
-                    <!-- 特征点表格 (单组模式，最多一行) -->
+                    <!-- 特征点表格 (多组模式，每组一行) -->
                     <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
                         <thead>
                             <tr style="background: #f0f2ff;">
@@ -679,7 +738,7 @@
                         <tbody>
                             <tr v-if="!calibPairRows.length">
                                 <td colspan="8" style="padding: 18px; text-align: center; color: #999; border: 1px solid #ddd;">
-                                    暂无特征点 —— 精细对齐后点「自动取点 (测量移动像素距离)」一键填充，或在叠加画面上点击同一特征点
+                                    暂无特征点 —— 点「确定对齐」锁定后，在叠加画面上点击特征点即可取点
                                 </td>
                             </tr>
                             <tr v-for="row in calibPairRows" :key="row.id">
@@ -733,6 +792,9 @@
                     </button>
                 </div>
             </div>
+
+
+            
         </div>
     </div>
 

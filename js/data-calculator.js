@@ -95,23 +95,32 @@ export function generateCalculationResults(diameterData, radiusData, averageRadi
 }
 
 // ===== 平均曲率半径的不确定度评定 =====
-// t 分布临界值 t₀.₉₅(ν) (双尾, P=0.95), 自由度 ν=1..30; ν>30 或 ν→∞ 取正态 1.96
-const T_TABLE_95 = [
-    12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228,
-    2.201, 2.179, 2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086,
-    2.080, 2.074, 2.069, 2.064, 2.060, 2.056, 2.052, 2.048, 2.045, 2.042
-];
-function tFactor95(nu) {
-    if (!isFinite(nu) || nu >= 30 || nu <= 0) return 1.96;   // ν→∞ (B类主导) 或异常时取正态
-    const idx = Math.max(1, Math.floor(nu));                 // 向下取整 (偏保守, t 略大)
-    return T_TABLE_95[idx - 1];
-}
-// 保留 2 位有效数字, 返回字符串与对应小数位 (用于均值/不确定度对齐显示)
-function sig2(x) {
+// 不确定度修约: 一般保留 1 位有效数字, 首位有效数字为 1 或 2 时保留 2 位; 采用"只进不舍"(逢余即入, 宁大勿小)。
+// 返回 { text, decimals }: text=修约后字符串; decimals=该结果实际小数位 (供均值 R̄ 四舍六入五成双对齐 U 末位)。
+function sigU(x) {
     if (!isFinite(x) || x === 0) return { text: '0', decimals: 0 };
-    const exp = Math.floor(Math.log10(Math.abs(x)));
-    const decimals = Math.max(0, 1 - exp);                   // 2 位有效 → 小数位 = 1 − 数量级
-    return { text: x.toFixed(decimals), decimals };
+    const ax = Math.abs(x);
+    const exp = Math.floor(Math.log10(ax));                  // 数量级: ax = d.ddd × 10^exp
+    const lead = Math.floor(ax / Math.pow(10, exp) + 1e-9);  // 首位有效数字 (按原值判定; +1e-9 防浮点噪声如 2.9999999)
+    const sig = (lead === 1 || lead === 2) ? 2 : 1;          // 首位 1/2 → 2 位有效, 否则 1 位
+    const q = Math.pow(10, exp - (sig - 1));                 // 修约量子: 末位保留数字所在位权
+    // 只进不舍: 向上取整到 q 的整数倍 (减 1e-9 噪声容差, 避免 3.0000000004 被误进位)
+    const r = Math.ceil(ax / q - 1e-9) * q;                  // 修约结果 (可能进位跨数量级, 如 0.0999 → 0.1)
+    const expR = r > 0 ? Math.floor(Math.log10(r)) : exp;    // 按结果实际数量级重算小数位
+    const decimals = Math.max(0, (sig - 1) - expR);          // 跨位进位后不回填多余 0 (得 0.1 而非 0.10)
+    return { text: r.toFixed(decimals), decimals };
+}
+// 四舍六入五成双 (round-half-to-even): 修约到 decimals 位小数; 被舍去部分 <半舍去、>半进一、恰好半则末位取偶(奇进偶舍)。
+// 1e-9 容差吸收浮点噪声 (如 25.65×10=256.49999… 视为恰好半)。均值 R̄ 为正, 无需处理负号方向。
+function roundHalfEven(x, decimals) {
+    const f = Math.pow(10, decimals);
+    const scaled = x * f;
+    const floor = Math.floor(scaled);
+    const frac = scaled - floor;
+    let n;
+    if (Math.abs(frac - 0.5) < 1e-9) n = (floor % 2 === 0) ? floor : floor + 1;  // 五成双: 末位奇进偶舍
+    else n = (frac > 0.5) ? floor + 1 : floor;                                    // 四舍六入
+    return (n / f).toFixed(decimals);
 }
 
 // 计算平均曲率半径的不确定度 (按五步评定): B类(仪器误差) → B类相对 → A类(多组) → 合成 → 扩展
@@ -120,9 +129,9 @@ export function calculateRadiusUncertainty(radiusData, averageRadius, pixelScale
     const k = radiusData?.length || 0;
     if (k === 0 || !(averageRadius > 0)) return null;
 
-    // 1. 直径 D 的 B 类: 一次直径读 2 次显微镜刻度 (左、右), 单次示值误差限 Δ 均匀分布
-    const uBx = INSTRUMENT_ERROR / Math.sqrt(3);               // 单次读数 u_B(x) = Δ/√3
-    const uBD = Math.sqrt(2) * uBx;                            // 直径为两次读数之差 u_B(D) = √2·Δ/√3
+    // 1. 直径 D 的 B 类: 一次直径读 2 次显微镜刻度 (左、右), 单次示值误差限 Δ 按正态分布取 p=0.683、包含因子 k=1
+    const uBx = INSTRUMENT_ERROR / 1;                          // 单次读数 u_B(x) = Δ/k = Δ/1 = Δ (p=0.683, k=1)
+    const uBD = Math.sqrt(2) * uBx;                            // 直径为两次读数之差 u_B(D) = √2·u_B(x) = √2·Δ
 
     // 2. R 的 B 类相对不确定度 (逐组): u_B(R)/R = 2·u_B(D)/(Dm²−Dn²)·√(Dm²+Dn²), u_B(R)_i = R_i·rel
     const perGroup = radiusData
@@ -147,30 +156,29 @@ export function calculateRadiusUncertainty(radiusData, averageRadius, pixelScale
     // 4. 合成标准不确定度 u_C(R) = √[u_A²(R̄) + u_B²(R)]
     const uC = Math.sqrt(uA * uA + uB * uB);
 
-    // 5. 扩展不确定度 (P=0.95): 有效自由度 Welch–Satterthwaite (B类视为系统 ν_B→∞), U = k·u_C
+    // 5. 扩展不确定度 (p=0.683, k=1): U = k·u_C = u_C。ν_eff (Welch–Satterthwaite, B类视为系统 ν_B→∞) 仅作自由度参考, 不再决定包含因子
     let nuEff = Infinity;
     if (uA > 0 && uC > 0) nuEff = Math.pow(uC, 4) / (Math.pow(uA, 4) / nuA);
-    const kFactor = tFactor95(nuEff);
-    const U = kFactor * uC;
+    const U = uC;                                              // 包含因子 k=1 (p=0.683, 正态 1σ) → U = u_C
     const relative = averageRadius > 0 ? U / averageRadius : 0;
 
-    const uFmt = sig2(U);
-    const decimals = uFmt.decimals;
+    const uFmt = sigU(U);
+    const decimals = uFmt.decimals;                          // U 修约后的实际小数位, 供均值四舍六入五成双对齐
     return {
         valid: uC > 0 && isFinite(uC),
         k, mean: averageRadius,
         deltaInstrument: INSTRUMENT_ERROR, uBx, uBD, perGroup, uBRel, uB,
         s, sumSqDev, uA, nuA,
-        uC, nuEff, kFactor, U, relative,
-        meanText: averageRadius.toFixed(decimals),
-        uText: U.toFixed(decimals),
-        uAText: sig2(uA).text,
-        uBText: sig2(uB).text,
-        uCText: sig2(uC).text,
+        uC, nuEff, U, relative,
+        meanText: roundHalfEven(averageRadius, decimals),    // R̄ 四舍六入五成双对齐 U 末位 (最佳估计值, 不套用只进不舍)
+        uText: uFmt.text,                                    // U: 只进不舍修约值 (不再用 toFixed 四舍五入)
+        uAText: sigU(uA).text,
+        uBText: sigU(uB).text,
+        uCText: sigU(uC).text,
         uBxText: uBx.toFixed(6),
         uBDText: uBD.toFixed(6),
         nuEffText: isFinite(nuEff) ? nuEff.toFixed(1) : '∞',
-        kText: kFactor.toFixed(2),
-        relativeText: (relative * 100).toFixed(2) + '%'
+        kText: '1',                                          // 包含因子 k=1 (p=0.683)
+        relativeText: sigU(relative * 100).text + '%'        // 相对不确定度: 精确比值 → 同规则(只进不舍)修约 → 百分比
     };
 }
