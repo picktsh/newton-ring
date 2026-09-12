@@ -7,7 +7,7 @@ import { initCanvasInteraction, onTableRowHover, onTableRowLeave, initDragDrop, 
 import { calculateDiameterData, calculateRadiusData, calculateAverageRadius, generateCalculationResults, calculateRadiusUncertainty, ringRadius } from './data-calculator.js';
 import { drawDetectionResults, clearCanvas, drawCenterOverlay, drawOverlay } from './canvas-drawer.js';
 import {
-    refineTranslationNear, refineTranslationByRings, verifyOverlayOffset, loadImageEl
+    verifyOverlayOffset, solveGlobalTranslation, selfCheckGlobalAlignment, loadImageEl
 } from './image-registrator.js';
 import { RING_COLOR } from './constants.js';
 
@@ -710,16 +710,16 @@ export default {
                     showStatus(`❌ 检查对齐失败: ${res.message}`, 'error');
                     return;
                 }
-                overlayCheckCenters = { centerA: res.centerA, centerB: res.centerB };
+                overlayCheckCenters = (res.centerA && res.centerB) ? { centerA: res.centerA, centerB: res.centerB } : null;
                 nextTick(drawOverlayCanvas);
                 const devText = res.dev.toFixed(1);
+                const psrText = res.psr != null ? `PSR ${res.psr.toFixed(1)}` : '';
                 if (res.dev <= 2) {
-                    overlayFineMsg.value = `✅ 对齐准确: 环系圆心残差 ${devText}px (${res.detail})，可直接取点；追求亚像素精度可再点「精细对齐」`;
+                    overlayFineMsg.value = `✅ 对齐准确: 残差 ${devText}px (${psrText}, ${res.detail})，可直接点「确定对齐」锁定取点${res.crossWarn || ''}`;
                     showStatus(`✅ 检查对齐: 残差 ${devText}px，对齐准确`, 'success');
                 } else {
                     const sugText = res.suggestion ? describeShiftDirection(res.suggestion.dx, res.suggestion.dy) : '';
-                    const near = res.dev <= 36;
-                    overlayFineMsg.value = `⚠️ 对齐不够: 环系圆心残差 ${devText}px (${res.detail})${sugText ? ` → 建议把圆环${sugText}` : ''}${near ? '；或直接点「精细对齐」自动微调' : '，偏差超出精细对齐范围，请先继续手动粗对齐'}`;
+                    overlayFineMsg.value = `⚠️ 对齐不够: 残差 ${devText}px (${psrText})${sugText ? ` → 建议把圆环${sugText}` : ''}；可继续手动微调，或到「自动全局对齐」一键求解${res.crossWarn || ''}`;
                     showStatus(`⚠️ 检查对齐: 残差 ${devText}px${sugText ? `，建议${sugText}` : ''}`, 'error');
                 }
             } catch (err) {
@@ -1050,56 +1050,64 @@ export default {
             return parts.join('、');
         }
 
-        // 精细对齐: 首选多环圆心拟合 (整圈采样免疫环纹局部自相似歧义)，失败回退局部模板微调；
-        // 结果不可靠时保持位置不变并在卡片内提示 (附方向性调整建议)；成功时保留亚像素浮点偏移 (不取整，贯通到取点换算)
-        async function runOverlayFineAlign() {
-            if (!overlayReady.value || overlayFineBusy.value || overlayLocked.value) return; // 锁定后禁止精细对齐改动偏移
+        // 自动全局对齐 (板块二): 整图相关从任意偏移直接求解完整平移量并写入偏移 (无需先手动粗对齐)；
+        // PSR 置信不足时保持位置不变并提示改用手动对齐；成功时保留亚像素浮点偏移 (贯通到取点换算)
+        async function runOverlayAutoAlign() {
+            if (!overlayReady.value || overlayFineBusy.value || overlayLocked.value) return; // 锁定后禁止改动偏移
             if (!cvReady.value) {
                 overlayFineMsg.value = '❌ OpenCV 尚未加载完成，请稍候再试';
                 return showStatus('❌ OpenCV 尚未加载完成，请稍候再试', 'error');
             }
-            stopOverlayBlink();   // 精细对齐会改偏移，闪动中难以观察微调结果
+            stopOverlayBlink();   // 自动对齐会改偏移，闪动中难以观察结果
             overlayFineBusy.value = true;
-            overlayFineMsg.value = '🔬 正在精细对齐 (拟合环系圆心)…';
-            showStatus('🔬 正在精细对齐…', 'info');
+            overlayFineMsg.value = '🤖 正在自动全局对齐 (整图相关求解平移)…';
+            showStatus('🤖 正在自动全局对齐…', 'info');
             try {
-                const args = [{ src: calibImageA.value.src }, { src: calibImageB.value.src }, overlayDx.value, overlayDy.value];
+                const res = await solveGlobalTranslation({ src: calibImageA.value.src }, { src: calibImageB.value.src });
+                if (!res.ok) {
+                    overlayFineMsg.value = `⚠️ 自动对齐未能可靠求解，位置保持不变: ${res.message}。→ 建议改用板块一手动对齐 (拖滑块/方向键 + 闪烁对比)`;
+                    showStatus(`⚠️ 自动对齐不可靠，已保持当前位置: ${res.message}`, 'error');
+                    return;
+                }
                 const oldDx = overlayDx.value, oldDy = overlayDy.value;
-                const ring = await refineTranslationByRings(...args);
-                let res = ring;
-                if (!ring.ok) {
-                    overlayFineMsg.value = '🔬 环拟合不可用，改用局部模板微调…';
-                    res = await refineTranslationNear(...args);
-                }
-                const method = res.method || '局部模板微调';
-                if (res.ok) {
-                    overlayDx.value = res.dx;   // 浮点亚像素偏移 (滑块仍可按 1px 手动覆盖)
-                    overlayDy.value = res.dy;
-                    overlayFitCenters = (res.centerA && res.centerB) ? { centerA: res.centerA, centerB: res.centerB } : null;
-                    overlayFineDone.value = true;
-                    overlayKeyFocus.value = true;
-                    const moved = describeShiftDirection(res.dx - oldDx, res.dy - oldDy);
-                    const movedText = moved ? `，本次${moved}` : '';
-                    overlayFineMsg.value = `✅ 精细对齐完成 (${method}): 偏移 Δx=${overlayDxText.value}px, Δy=${overlayDyText.value}px${movedText} (${res.detail})，可点击叠加画面取点`;
-                    showStatus(`✅ 精细对齐完成 (${method}): Δx=${overlayDxText.value}, Δy=${overlayDyText.value}${movedText} (${res.detail})`, 'success');
-                } else {
-                    const reasons = ring.ok ? res.message : `环拟合: ${ring.message}；模板微调: ${res.message}`;
-                    // 方向性调整建议: 环拟合目标最可信 (拟合圆心反推)，其次模板修正方向；无方向信息时提示参考重合度残差粗对齐
-                    const sug = (!ring.ok && ring.suggestion) ? ring.suggestion : res.suggestion;
-                    const sugText = sug ? describeShiftDirection(sug.dx, sug.dy) : '';
-                    overlayFineMsg.value = sugText
-                        ? `⚠️ 结果不可靠，位置保持不变: ${reasons}。→ 建议: 把圆环${sugText} (滑块/方向键粗对齐) 后再点精细对齐`
-                        : `⚠️ 结果不可靠，位置保持不变: ${reasons}。→ 建议: 参考重合度残差把数值调到最小后再点精细对齐`;
-                    showStatus(`⚠️ 精细对齐结果不可靠，已保持当前位置不变${sugText ? `，建议${sugText}` : ''}: ${reasons}`, 'error');
-                }
+                // 写入理想偏移 (限幅到滑块范围，避免极端值；鼓轮真实位移远小于半幅)
+                overlayDx.value = Math.max(-overlayMaxX.value, Math.min(overlayMaxX.value, res.dx));
+                overlayDy.value = Math.max(-overlayMaxY.value, Math.min(overlayMaxY.value, res.dy));
+                overlayFitCenters = null;   // 圆心标记交给「检查对齐」的交叉验证结果绘制
+                overlayFineDone.value = true;
+                overlayKeyFocus.value = true;
+                const moved = describeShiftDirection(overlayDx.value - oldDx, overlayDy.value - oldDy);
+                const movedText = moved ? `，本次${moved}` : '（已在对齐位置）';
+                overlayFineMsg.value = `✅ 自动全局对齐完成: 偏移 Δx=${overlayDxText.value}px, Δy=${overlayDyText.value}px${movedText} (${res.detail})。可点「检查对齐」复核或继续手动微调`;
+                showStatus(`✅ 自动全局对齐完成: Δx=${overlayDxText.value}, Δy=${overlayDyText.value}${movedText} (${res.detail})`, 'success');
+                nextTick(drawOverlayCanvas);
             } catch (err) {
-                console.error('精细对齐错误:', err);
-                overlayFineMsg.value = `❌ 精细对齐失败: ${err.message}`;
-                showStatus(`❌ 精细对齐失败: ${err.message}`, 'error');
+                console.error('自动对齐错误:', err);
+                overlayFineMsg.value = `❌ 自动对齐失败: ${err.message}`;
+                showStatus(`❌ 自动对齐失败: ${err.message}`, 'error');
             } finally {
                 overlayFineBusy.value = false;
             }
         }
+
+        // ===== 对齐自检 (控制台验收基准, 见需求 Q8/Q13) =====
+        // 在浏览器控制台执行 window.__alignSelfCheck() 即可: 用当前图A合成已知平移的 B',
+        // 验证全局相关的还原精度 (A-vs-A 偏移≈0 + warpAffine 已知平移误差<0.5px)，并据实测 PSR 标定阈值。
+        async function runAlignSelfCheck(shifts) {
+            if (!cvReady.value) { console.warn('[对齐自检] OpenCV 尚未加载完成，请稍候再试'); return null; }
+            if (!calibImageA.value) { console.warn('[对齐自检] 请先上传图A 再自检'); return null; }
+            console.log('%c[对齐自检] 开始: A-vs-A 自配准 + warpAffine 已知平移还原', 'color:#2980b9;font-weight:bold');
+            const report = await selfCheckGlobalAlignment({ src: calibImageA.value.src }, shifts);
+            console.table(report.results);
+            console.log(
+                report.ok
+                    ? `%c[对齐自检] ✅ 全部通过 (${report.passed}/${report.total}, 容差 ${report.tolPx}px)`
+                    : `%c[对齐自检] ❌ 未全部通过 (${report.passed}/${report.total}, 容差 ${report.tolPx}px)`,
+                report.ok ? 'color:#27ae60;font-weight:bold' : 'color:#c0392b;font-weight:bold'
+            );
+            return report;
+        }
+        window.__alignSelfCheck = runAlignSelfCheck;   // 挂到全局, 供浏览器控制台直接调用
 
         // ===== 对齐锁定: 用户目视确认对齐满意后点「确定对齐」锁住两图相对位置 =====
         // 锁定后偏移不可变 (滑块/方向键/精细对齐/复位全部禁用)，点击叠加画面即可手动取点；
@@ -2329,7 +2337,7 @@ export default {
             onOverlayImgLoad,
             onOverlayOffsetInput,
             resetOverlayShift,
-            runOverlayFineAlign,
+            runOverlayAutoAlign,
             runOverlayCheck,
             toggleOverlayLock,
             onOverlayClick,

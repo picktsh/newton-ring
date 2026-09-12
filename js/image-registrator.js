@@ -1,6 +1,8 @@
 // @ts-ignore
 /* global cv */
 
+import { backgroundNormalize, fitRingCenterRobust } from './ring-fitter.js';
+
 // ===== 像素标定配准模块 =====
 // 现役能力 (全自动「一键重叠」级联配准已移除，粗对齐改由用户拖滑块/方向键 + 闪烁对比手动完成):
 //   ① refineTranslationNear:    人工粗对齐后的局部小范围精细微调 (多模板 NCC + 修正量一致性验证)
@@ -112,6 +114,43 @@ function rectHitsCrosshair(x0, y0, x1, y1, vLine, hLine, margin = 4) {
   if (vLine && x0 < vLine.pos + vLine.half + margin && x1 > vLine.pos - vLine.half - margin) return true;
   if (hLine && y0 < hLine.pos + hLine.half + margin && y1 > hLine.pos - hLine.half - margin) return true;
   return false;
+}
+
+// 叉丝 inpaint 去除: 两图各自独立修补掉固定十字叉丝, 消除"两图同位置共享人工特征"在全局相关中造成的 d=0 假峰
+// (旧 fitRingCenter 也用 inpaint, 此处作用于背景归一化后的 Mat, 供全局相关预处理)
+function inpaintCrosshair(mat, vLine, hLine) {
+  if (!vLine && !hLine) return;
+  const mask = new cv.Mat(mat.rows, mat.cols, cv.CV_8UC1, new cv.Scalar(0));
+  const white = new cv.Scalar(255, 255, 255, 255);
+  try {
+    if (vLine) cv.rectangle(mask, new cv.Point(vLine.pos - vLine.half, 0), new cv.Point(vLine.pos + vLine.half, mat.rows - 1), white, -1);
+    if (hLine) cv.rectangle(mask, new cv.Point(0, hLine.pos - hLine.half), new cv.Point(mat.cols - 1, hLine.pos + hLine.half), white, -1);
+    const out = new cv.Mat();
+    cv.inpaint(mat, mask, out, 3, cv.INPAINT_TELEA);
+    out.copyTo(mat);
+    out.delete();
+  } finally {
+    mask.delete();
+  }
+}
+
+// 相关面峰旁瓣比 PSR: (主峰 − 旁瓣均值) / 旁瓣标准差, 旁瓣 = 主峰 excludeR 邻域外的全部值。
+// 真对齐时相关峰尖锐突出 → PSR 高; 纹理不足/伪匹配时峰平坦 → PSR 低。用作"绝不假阳性"的置信闸门。
+function psrOfSurface(result, px, py, excludeR = 5) {
+  const cols = result.cols, rows = result.rows, data = result.data32F;
+  const peak = data[py * cols + px];
+  let sum = 0, sumSq = 0, cnt = 0;
+  for (let y = 0; y < rows; y++) {
+    for (let x = 0; x < cols; x++) {
+      if (Math.abs(x - px) <= excludeR && Math.abs(y - py) <= excludeR) continue;
+      const v = data[y * cols + x];
+      sum += v; sumSq += v * v; cnt++;
+    }
+  }
+  if (cnt < 16) return 0;
+  const mean = sum / cnt;
+  const std = Math.sqrt(Math.max(1e-9, sumSq / cnt - mean * mean));
+  return (peak - mean) / std;
 }
 
 // 3 点抛物线峰精修: 主峰非边界时用相邻两行/列拟合亚像素偏移，返回浮点峰位或 null (不可精修)
@@ -694,66 +733,143 @@ function fitRingCenterSeeded(src, label, seedX, seedY) {
   }
 }
 
-// ---------- ② 手动粗对齐质量检查 (只读判定，不改变偏移) ----------
-// 原理: 两图独立拟合环系圆心，按当前绘制偏移 (tx, ty) 换算后两圆心应重合；残差即对齐误差。
-// 返回 { ok, dev, centerA, centerB, suggestion?, message }，供 UI 判定"手动重叠是否准确"并给出调整方向；
-// suggestion 为建议的绘制偏移增量 (+Δx=图B右移)，偏差超限时仅供方向参考不自动应用。
-export async function verifyOverlayOffset(calibImageA, calibImageB, tx, ty) {
+// ---------- ②a 全局平移求解 (相位相关思想的两阶段 NCC，对齐主判据) ----------
+// 为什么不用旧圆心拟合: fitRingCenter 在暗场图上会收敛到伪圆盆地 (同图不同分辨率圆心差数百 px)，
+// 直接拿它当对齐判据既假阳性又乱给方向。改用整图相关: 牛顿环 r∝√k 间距非均匀，整图相关峰全局唯一，
+// 从任意偏移都能直接求出真实平移 (捕获范围 = 图边 − 模板边，可达数百 px)，且免疫伪圆。
+// 阶段1: 降采样 + 中心大模板 NCC 全局粗求解 (INTER_AREA 缩图，TM_CCOEFF_NORMED 抗曝光差)；
+// 阶段2: 全分辨率多模板 NCC 亚像素精修 (复用 matchTemplateNear 的 ±R 窗口 + 抛物线亚像素)；
+// PSR (峰旁瓣比) 作置信闸门: 峰不够尖锐即判不可靠，绝不返回可能被误信的结果。
+// 返回 dx, dy 为「理想绘制偏移」(与 overlayDx/overlayDy 同口径，可直接写入或用于求残差)
+export async function solveGlobalTranslation(calibImageA, calibImageB, options = {}) {
+  const opts = {
+    coarseMaxDim: 720,     // 阶段1 降采样长边上限 (提速；相关面峰位换算回全分辨率)
+    templateRatio: 0.55,   // 中心模板占短边比例 (捕获范围 = 图边×(1−ratio)，越小范围越大但可靠性降)
+    psrMin: 5.0,           // 峰旁瓣比下限 (低于此判纹理不足/不可靠，用真实图可标定微调)
+    scoreMin: 0.30,        // NCC 峰得分下限
+    refineRange: 10,       // 阶段2 全分辨率亚像素精修窗口半径 (px)
+    ...options
+  };
   const imgElA = await loadImageEl(calibImageA.src);
   const imgElB = await loadImageEl(calibImageB.src);
-  let srcA = null, srcB = null, smallA = null, smallB = null;
+  let srcA = null, srcB = null, grayA = null, grayB = null, normA = null, normB = null, smallA = null, smallB = null;
+  const mats = [];
   try {
     srcA = cv.imread(imgElA);
     srcB = cv.imread(imgElB);
-    if (srcA.rows !== srcB.rows || srcA.cols !== srcB.cols) {
-      return { ok: false, message: '两图尺寸不一致' };
-    }
-    // 缩图加速: 全尺寸大图上霍夫圆检测+三轮逐环精修耗时可达数十秒并阻塞主线程 (界面卡死)；
-    // 长边超过上限时先缩到 ≤900px 再拟合，结果换算回原图像素 (环系圆心是几何中心，缩放不改变相对结构，
-    // INTER_AREA 保留环纹梯度信息)，拟合耗时降至 1~2 秒级。
-    const MAX_DIM = 900;
-    const scale = Math.min(1, MAX_DIM / Math.max(srcA.rows, srcA.cols));
-    let fitSrcA = srcA, fitSrcB = srcB;
+    if (srcA.rows !== srcB.rows || srcA.cols !== srcB.cols) return { ok: false, message: '两图尺寸不一致' };
+    grayA = new cv.Mat(); grayB = new cv.Mat();
+    cv.cvtColor(srcA, grayA, srcA.channels() === 3 ? cv.COLOR_RGB2GRAY : cv.COLOR_RGBA2GRAY);
+    cv.cvtColor(srcB, grayB, srcB.channels() === 3 ? cv.COLOR_RGB2GRAY : cv.COLOR_RGBA2GRAY);
+    // 背景照度归一化 (替代 equalizeHist，消除暗场渐晕而非放大它)
+    normA = backgroundNormalize(grayA);
+    normB = backgroundNormalize(grayB);
+    // 叉丝: 检测后两图各自 inpaint 修补掉，消除"同位置共享人工特征"造成的 d=0 假峰
+    const { vLine, hLine } = detectCrosshair(grayA);
+    if (vLine || hLine) { inpaintCrosshair(normA, vLine, hLine); inpaintCrosshair(normB, vLine, hLine); }
+
+    // ---- 阶段1: 降采样全局粗求解 ----
+    const maxDim = Math.max(normA.rows, normA.cols);
+    const scale = Math.min(1, opts.coarseMaxDim / maxDim);
+    let fitA = normA, fitB = normB;
     if (scale < 1) {
-      const dsize = new cv.Size(Math.max(1, Math.round(srcA.cols * scale)), Math.max(1, Math.round(srcA.rows * scale)));
+      const ds = new cv.Size(Math.max(1, Math.round(normA.cols * scale)), Math.max(1, Math.round(normA.rows * scale)));
       smallA = new cv.Mat(); smallB = new cv.Mat();
-      cv.resize(srcA, smallA, dsize, 0, 0, cv.INTER_AREA);
-      cv.resize(srcB, smallB, dsize, 0, 0, cv.INTER_AREA);
-      // cv.Size 在本 OpenCV 构建中是轻量值对象、无 delete 方法 (仅 cv.Mat 等堆对象才有)，
-      // 直接 dsize.delete() 会抛 TypeError 使大图(长边>900px)走进缩图分支时检查对齐直接失败；
-      // 改可选调用: 无 delete 时交给 JS 垃圾回收，有 delete 的构建则正常释放。
-      dsize.delete?.();
-      fitSrcA = smallA; fitSrcB = smallB;
+      cv.resize(normA, smallA, ds, 0, 0, cv.INTER_AREA);
+      cv.resize(normB, smallB, ds, 0, 0, cv.INTER_AREA);
+      ds.delete?.();
+      fitA = smallA; fitB = smallB;
     }
-    const fitA = fitRingCenter(fitSrcA, 'A');
-    const fitB = fitRingCenter(fitSrcB, 'B');
-    if (!fitA.ok) return { ok: false, message: `图A 圆环拟合失败 (${fitA.message})` };
-    if (!fitB.ok) return { ok: false, message: `图B 圆环拟合失败 (${fitB.message})` };
-    // 拟合坐标换算回原图像素口径 (与传入的 tx, ty 同单位)
-    const centerA = { x: fitA.cx / scale, y: fitA.cy / scale };
-    const centerB = { x: fitB.cx / scale, y: fitB.cy / scale };
-    // 图B圆心按当前绘制偏移换算到图A坐标系，与图A圆心之差 = 对齐残差 (对齐良好时两圆心重合)
-    const ex = (centerB.x + tx) - centerA.x;
-    const ey = (centerB.y + ty) - centerA.y;
-    const dev = Math.hypot(ex, ey);
-    console.log(`[对齐检查] 心A=(${centerA.x.toFixed(1)}, ${centerA.y.toFixed(1)}) [${fitA.rings.length}环], 心B=(${centerB.x.toFixed(1)}, ${centerB.y.toFixed(1)}) [${fitB.rings.length}环], ` +
-      `当前偏移(${tx}, ${ty}) 下残差=${dev.toFixed(2)}px${scale < 1 ? ` (缩图 ${scale.toFixed(2)}x)` : ''}`);
+    const tSize = Math.max(48, Math.round(Math.min(fitA.cols, fitA.rows) * opts.templateRatio));
+    if (tSize >= fitA.cols || tSize >= fitA.rows) return { ok: false, message: '图像过小，无法做全局相关' };
+    const x0 = Math.round((fitA.cols - tSize) / 2), y0 = Math.round((fitA.rows - tSize) / 2);
+    const tmpl = fitA.roi(new cv.Rect(x0, y0, tSize, tSize)).clone(); mats.push(tmpl);
+    const surf = new cv.Mat(); mats.push(surf);
+    cv.matchTemplate(fitB, tmpl, surf, cv.TM_CCOEFF_NORMED);
+    const mm = cv.minMaxLoc(surf);
+    let px = mm.maxLoc.x, py = mm.maxLoc.y;
+    const score = mm.maxVal;
+    const psr = psrOfSurface(surf, px, py);
+    const sub = subpixelPeak(surf, px, py); if (sub) { px = sub.x; py = sub.y; }
+    // 模板左上 (x0,y0) 的 A 特征匹配到 B 的 (px,py): d=(px−x0, py−y0)，绘制偏移 t=−d，换算回全分辨率
+    const txCoarse = (x0 - px) / scale, tyCoarse = (y0 - py) / scale;
+    console.log(`[全局相关] 粗求解: NCC=${score.toFixed(3)}, PSR=${psr.toFixed(1)}, 模板边=${tSize}, 缩图=${scale.toFixed(2)}x → 偏移(${txCoarse.toFixed(1)}, ${tyCoarse.toFixed(1)})`);
+    if (score < opts.scoreMin || psr < opts.psrMin) {
+      return { ok: false, score, psr, message: `全局相关置信度不足 (NCC ${score.toFixed(2)} / PSR ${psr.toFixed(1)})，纹理过弱或两图差异过大，无法可靠判定` };
+    }
+
+    // ---- 阶段2: 全分辨率亚像素精修 (围绕粗偏移的多模板 NCC 一致性) ----
+    let tx = txCoarse, ty = tyCoarse, refined = false, spread = 0, bestScore = score;
+    const R = Math.max(4, Math.round(opts.refineRange));
+    const tSize2 = Math.max(48, Math.min(220, Math.round(Math.min(normA.cols, normA.rows) * 0.22)));
+    const cands = pickFineTemplates(normA, { x: normA.cols / 2, y: normA.rows / 2 }, tSize2, null, null, R, 3);
+    const list = [];
+    for (const sel of cands) {
+      const r = matchTemplateNear(normA, normB, sel, tSize2, txCoarse, tyCoarse, R, null, null, mats);
+      if (r) list.push(r);
+    }
+    if (list.length >= 2) {
+      for (let i = 0; i < list.length; i++) for (let j = i + 1; j < list.length; j++)
+        spread = Math.max(spread, Math.hypot(list[i].dx - list[j].dx, list[i].dy - list[j].dy));
+      const usable = list.filter(r => r.score >= opts.scoreMin && !r.saturated);
+      if (usable.length >= 2 && spread <= 3.0) {
+        tx = txCoarse + median(usable.map(r => r.dx));
+        ty = tyCoarse + median(usable.map(r => r.dy));
+        bestScore = Math.min(...usable.map(r => r.score));
+        refined = true;
+      }
+    }
+    console.log(`[全局相关] 精修: ${refined ? `采纳 → 偏移(${tx.toFixed(2)}, ${ty.toFixed(2)})，${list.length}模板一致性差${spread.toFixed(2)}px` : '粗解已足够/精修未采纳 (一致性不足或模板不够)'}`);
     return {
-      ok: true,
-      dev,
-      centerA,
-      centerB,
-      detail: `环数 ${fitA.rings.length}/${fitB.rings.length}, 离散度 ${(fitA.dispersion / scale).toFixed(2)}/${(fitB.dispersion / scale).toFixed(2)}px`,
-      suggestion: dev > 0 ? { dx: -ex, dy: -ey } : null
+      ok: true, dx: tx, dy: ty, psr, score: bestScore, method: '全局相关', refined,
+      detail: `NCC ${bestScore.toFixed(3)}, PSR ${psr.toFixed(1)}${refined ? ', 亚像素精修' : ', 粗解'}${vLine || hLine ? ', 叉丝已修补' : ''}`
     };
   } catch (e) {
-    return { ok: false, message: e.message || '对齐检查异常' };
+    return { ok: false, message: e?.message || '全局相关对齐异常' };
   } finally {
-    srcA?.delete?.();
-    srcB?.delete?.();
-    smallA?.delete?.();
-    smallB?.delete?.();
+    for (const m of mats) m?.delete?.();
+    srcA?.delete?.(); srcB?.delete?.(); grayA?.delete?.(); grayB?.delete?.();
+    normA?.delete?.(); normB?.delete?.(); smallA?.delete?.(); smallB?.delete?.();
   }
+}
+
+// ---------- ②b 手动粗对齐质量检查 (只读判定，不改变偏移) ----------
+// 主判据: 全局相关求出"理想偏移"，残差 = |理想偏移 − 当前偏移| (对齐良好时当前偏移≈理想偏移，残差≈0)。
+// PSR 不达标 (全局相关不可靠) 时直接判无法检查，绝不显示可能被误信的残差数字。
+// 环系圆心仅作交叉验证 (鲁棒管线): 与相关结果矛盾时附提示，但不否决更可信的相关结果。
+// 返回 { ok, dev, dx, dy, psr, centerA?, centerB?, suggestion?, crossWarn?, message? }；
+// suggestion = 建议的绘制偏移增量 (理想 − 当前，+Δx=图B右移)，供 UI 给方向提示。
+export async function verifyOverlayOffset(calibImageA, calibImageB, tx, ty, options = {}) {
+  const g = await solveGlobalTranslation(calibImageA, calibImageB, options);
+  if (!g.ok) return { ok: false, message: g.message, psr: g.psr, score: g.score };
+  const ex = g.dx - tx, ey = g.dy - ty;   // 需施加的修正量 (理想 − 当前)
+  const dev = Math.hypot(ex, ey);
+  // 交叉验证: 鲁棒环系圆心 (失败或矛盾都不否决相关主判据，仅提示)
+  let centerA = null, centerB = null, crossWarn = '';
+  let sA = null, sB = null;
+  try {
+    const imgElA = await loadImageEl(calibImageA.src);
+    const imgElB = await loadImageEl(calibImageB.src);
+    sA = cv.imread(imgElA); sB = cv.imread(imgElB);
+    const fA = fitRingCenterRobust(sA, 'A');
+    const fB = fitRingCenterRobust(sB, 'B');
+    if (fA.ok && fB.ok) {
+      centerA = { x: fA.cx, y: fA.cy };
+      centerB = { x: fB.cx, y: fB.cy };
+      // 按理想偏移换算后 B 圆心应落在 A 圆心处: (fB + g.d) − fA ≈ 0
+      const cdev = Math.hypot((fB.cx + g.dx) - fA.cx, (fB.cy + g.dy) - fA.cy);
+      if (cdev > Math.max(8, dev + 5)) {
+        crossWarn = `；⚠️ 环拟合交叉验证偏差 ${cdev.toFixed(1)}px 与相关结果不一致，建议开闪烁对比目视复核`;
+      }
+    }
+  } catch (e) { /* 交叉验证异常不影响主判据 */ }
+  finally { sA?.delete?.(); sB?.delete?.(); }
+  console.log(`[对齐检查] 理想偏移=(${g.dx.toFixed(1)}, ${g.dy.toFixed(1)}), 当前偏移=(${tx}, ${ty}), 残差=${dev.toFixed(2)}px, PSR=${g.psr?.toFixed(1)}${crossWarn ? ' [交叉验证告警]' : ''}`);
+  return {
+    ok: true, dev, dx: g.dx, dy: g.dy, psr: g.psr, score: g.score,
+    centerA, centerB, detail: g.detail, crossWarn,
+    suggestion: dev > 0.5 ? { dx: ex, dy: ey } : null
+  };
 }
 // ---------- ③ 基于多环圆心拟合的精细对齐 (叠加对齐首选通路) ----------
 // 原理: 牛顿环半径满足 r_k ∝ √k，每环绝对半径全局唯一 (相邻环仅局部纹理自相似)；
@@ -850,4 +966,59 @@ export async function refineTranslationByRings(calibImageA, calibImageB, tx, ty,
     srcA?.delete?.();
     srcB?.delete?.();
   }
+}
+
+// ---------- ④ 浏览器控制台自检 (验收基准, 见需求 Q8/Q13) ----------
+// 目的: 无需真实两图即可标定全局相关的正确性与 PSR 阈值。
+//   用例1 A-vs-A 自配准: B'=A → 期望绘制偏移 ≈ 0 (偏移不为 0 说明主判据系统性有偏)；
+//   用例2 warpAffine 已知平移: 把 A 平移 (sx,sy) 合成 B' → 期望 solveGlobalTranslation 返回 (-sx,-sy)，还原误差应 < tolPx。
+// 用法: 控制台执行 __alignSelfCheck() 或 __alignSelfCheck([[0,0],[20,-15],[-40,30]])。
+
+// 用 warpAffine 把图 A 平移 (sx, sy) 合成一张 dataURL (BORDER_REPLICATE 补边, 与实拍同尺寸)
+function makeTranslatedSrc(imgEl, sx, sy) {
+  const src = cv.imread(imgEl);
+  const dst = new cv.Mat();
+  const M = cv.matFromArray(2, 3, cv.CV_32F, [1, 0, sx, 0, 1, sy]);
+  const size = new cv.Size(src.cols, src.rows);
+  let canvas = null;
+  try {
+    cv.warpAffine(src, dst, M, size, cv.INTER_LINEAR, cv.BORDER_REPLICATE);
+    canvas = document.createElement('canvas');
+    canvas.width = src.cols; canvas.height = src.rows;
+    cv.imshow(canvas, dst);
+    return canvas.toDataURL('image/png');
+  } finally {
+    src.delete(); dst.delete(); M.delete(); size.delete();
+  }
+}
+
+// 全局相关自检: 对每个已知平移合成 B' 并跑 solveGlobalTranslation, 比对还原误差。
+// 返回 { ok, passed, total, tolPx, results } (results 供 console.table 打印)
+export async function selfCheckGlobalAlignment(calibImageA, shifts = [[0, 0], [20, -15], [-40, 30]], tolPx = 0.5) {
+  const imgElA = await loadImageEl(calibImageA.src);
+  const results = [];
+  for (const [sx, sy] of shifts) {
+    const expX = -sx, expY = -sy;   // B'=A平移(sx,sy) → 内部 d=(sx,sy) → 绘制偏移 t=-d=(-sx,-sy)
+    try {
+      // A-vs-A 用原图本身, 避免 warp 插值引入的伪差异; 其余用合成平移图
+      const srcB = (sx === 0 && sy === 0) ? calibImageA.src : makeTranslatedSrc(imgElA, sx, sy);
+      const res = await solveGlobalTranslation({ src: calibImageA.src }, { src: srcB });
+      if (!res.ok) {
+        results.push({ '平移': `(${sx}, ${sy})`, '期望偏移': `(${expX}, ${expY})`, '实测偏移': '—', '误差': '—', 'PSR': res.psr?.toFixed?.(1) ?? '—', '结论': `❌ 求解失败: ${res.message}` });
+        continue;
+      }
+      const err = Math.hypot(res.dx - expX, res.dy - expY);
+      const pass = err <= tolPx;
+      results.push({
+        '平移': `(${sx}, ${sy})`, '期望偏移': `(${expX}, ${expY})`,
+        '实测偏移': `(${res.dx.toFixed(2)}, ${res.dy.toFixed(2)})`,
+        '误差': err.toFixed(3) + 'px', 'PSR': res.psr.toFixed(1),
+        '结论': pass ? '✅ 通过' : `❌ 超差 (> ${tolPx}px)`
+      });
+    } catch (e) {
+      results.push({ '平移': `(${sx}, ${sy})`, '期望偏移': `(${expX}, ${expY})`, '实测偏移': '—', '误差': '—', 'PSR': '—', '结论': `❌ 异常: ${e?.message || e}` });
+    }
+  }
+  const passed = results.filter(r => String(r['结论']).startsWith('✅')).length;
+  return { ok: passed === results.length && results.length > 0, passed, total: results.length, tolPx, results };
 }
