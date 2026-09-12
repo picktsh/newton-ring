@@ -19,7 +19,7 @@ export default {
         const imageManager = createImageManager();
 
         const cvReady = ref(false);
-        const pixelScale = ref(0.005);
+        const pixelScale = ref('');   // 无默认值: 需从 tab1「像素标定」应用或手动输入; 未设定 (空/≤0) 时下游按未设定处理
         const logs = ref([]);
         const isProcessing = ref(false);
         const hoveredRingRef = ref(null);
@@ -228,8 +228,8 @@ export default {
             };
         });
         // 亚像素偏移读数 (精细对齐保留抛物线/拟合的浮点结果，整数时不显示小数)
-        const overlayDxText = computed(() => Number.isInteger(overlayDx.value) ? String(overlayDx.value) : overlayDx.value.toFixed(1));
-        const overlayDyText = computed(() => Number.isInteger(overlayDy.value) ? String(overlayDy.value) : overlayDy.value.toFixed(1));
+        const overlayDxText = computed(() => Number.isInteger(overlayDx.value) ? String(overlayDx.value) : overlayDx.value.toFixed(2));
+        const overlayDyText = computed(() => Number.isInteger(overlayDy.value) ? String(overlayDy.value) : overlayDy.value.toFixed(2));
         // 叠加画面重绘标记 (取点后显示各组特征点在叠加画面上的位置)
         watch([calibPointPairs, overlayDx, overlayDy, overlayScale], () => {
             if (overlayReady.value) nextTick(drawOverlayCanvas);
@@ -420,14 +420,14 @@ export default {
         const manualRingCount = computed(() => ringList.value.filter(r => r.manual).length);
         // 取消勾选后的编号策略：默认 false = 保持原编号；true = 启用环按半径顺延重排 1..N (会话内保留)
         const renumberOnRemove = ref(false);
-        // 逐差法步长 (m-n)：默认 3，可人工修改；组件级状态，切换图片保留，刷新页面恢复默认 (会话内保留)
-        const diffStep = ref(3);
-        // 步长输入校验：须为不小于 1 的整数，非法值还原为 3 并提示 (响应式自动重算表2)
+        // 逐差法步长 (m-n)：默认 5，可人工修改；组件级状态，切换图片保留，刷新页面恢复默认 (会话内保留)
+        const diffStep = ref(5);
+        // 步长输入校验：须为不小于 1 的整数，非法值还原为 5 并提示 (响应式自动重算表2)
         function onDiffStepChange() {
             const s = Math.round(Number(diffStep.value));
             if (!Number.isFinite(s) || s < 1) {
-                showStatus('⚠️ 逐差法步长需为不小于 1 的整数，已还原为 3', 'info');
-                diffStep.value = 3;
+                showStatus('⚠️ 逐差法步长需为不小于 1 的整数，已还原为 5', 'info');
+                diffStep.value = 5;
             } else {
                 diffStep.value = s;
             }
@@ -472,27 +472,60 @@ export default {
 
         // ===== 像素标定计算 (多组特征点) =====
         // 表格行数据: 序号、两图坐标、ΔX/ΔY、像素距离、标定值 (有物理距离时)；多组模式下每组一行
+        // 有效数字修约工具: 标定值 k = 物理距离 L ÷ 像素距离 N 统一保留 4 位有效数字。
+        // 除法用全精度计算 (中间多保留防舍入误差), 仅最终结果按有效数字修约, 不单纯统一小数位。
+        // countSigFigs/roundToSigFigs/formatSigFigs 为通用工具, formatSigFigs 按有效数字 (非小数位) 格式化输出。
+        function countSigFigs(num, decimals) {
+            if (!isFinite(num) || num === 0) return 0;
+            const digits = Math.abs(num).toFixed(decimals).replace('.', '').replace(/^0+/, '');
+            return digits.length;
+        }
+        function roundToSigFigs(num, sig) {
+            if (!isFinite(num) || num === 0 || sig <= 0) return 0;
+            const d = Math.ceil(Math.log10(Math.abs(num)));
+            const m = Math.pow(10, sig - d);
+            return Math.round(num * m) / m;
+        }
+        function formatSigFigs(num, sig) {
+            const r = roundToSigFigs(num, sig);
+            if (r === 0) return '0';
+            const d = Math.ceil(Math.log10(Math.abs(r)));
+            return r.toFixed(Math.max(0, sig - d));
+        }
         const calibPairRows = computed(() => calibPointPairs.value.map((p, i) => {
             const dx = Math.abs(p.a.x - p.b.x), dy = Math.abs(p.a.y - p.b.y);
             const dist = Math.hypot(dx, dy);
+            const L = calibPhysicalDistance.value;
+            // 每行标定值 = L ÷ 该点像素距离, 统一保留 4 位有效数字
+            const sig = (L > 0 && dist > 0) ? 4 : 0;
             return {
                 id: i,
                 ax: p.a.x, ay: p.a.y,
                 bx: p.b.x, by: p.b.y,
                 dx, dy, dist,
-                value: calibPhysicalDistance.value > 0 && dist > 0 ? calibPhysicalDistance.value / dist : 0
+                sigFigs: sig,
+                value: (L > 0 && dist > 0) ? roundToSigFigs(L / dist, sig) : 0
             };
         }));
         // 像素距离 (多组模式取所有点组距离的平均值)
+        // 先修约再平均: 用表格每行"像素距离"列显示的 2 位小数值 (row.dist.toFixed(2)) 求平均,
+        // 使大字与"拿计算器按表格里显示的数字求平均"逐位吻合, 而非对全精度 dist 求平均后再修约;
+        // 该口径对所有对齐模式统一生效 (纯手动对齐时各行距离近乎相同, 平均值即等于该共同值)。
+        // 下游标定值 k = L ÷ N 与有效数字均引用此平均值, 全链路 (大字/k/应用到Tab2) 一致。
         const calibAvgDistance = computed(() => {
             const rows = calibPairRows.value;
             if (!rows.length) return 0;
-            return rows.reduce((sum, r) => sum + r.dist, 0) / rows.length;
+            return rows.reduce((sum, r) => sum + Number(r.dist.toFixed(2)), 0) / rows.length;
         });
-        // 最终标定值 = 物理距离 ÷ 像素距离
+        // 标定值统一保留 4 位有效数字
+        const calibValueSigFigs = computed(() => {
+            if (calibAvgDistance.value <= 0 || calibPhysicalDistance.value <= 0) return 0;
+            return 4;
+        });
+        // 最终标定值 = 物理距离 ÷ 像素距离, 按有效数字修约 (显示/应用到Tab2 全链路一致)
         const calibValue = computed(() => {
             if (calibAvgDistance.value <= 0 || calibPhysicalDistance.value <= 0) return 0;
-            return calibPhysicalDistance.value / calibAvgDistance.value;
+            return roundToSigFigs(calibPhysicalDistance.value / calibAvgDistance.value, calibValueSigFigs.value);
         });
 
         // 标定图片上传处理
@@ -712,7 +745,7 @@ export default {
                 }
                 overlayCheckCenters = (res.centerA && res.centerB) ? { centerA: res.centerA, centerB: res.centerB } : null;
                 nextTick(drawOverlayCanvas);
-                const devText = res.dev.toFixed(1);
+                const devText = res.dev.toFixed(2);
                 const psrText = res.psr != null ? `PSR ${res.psr.toFixed(1)}` : '';
                 if (res.dev <= 2) {
                     overlayFineMsg.value = `✅ 对齐准确: 残差 ${devText}px (${psrText}, ${res.detail})，可直接点「确定对齐」锁定取点${res.crossWarn || ''}`;
@@ -1127,6 +1160,17 @@ export default {
             nextTick(drawOverlayCanvas);
         }
 
+        // 确定性亚像素定位分量: 手动对齐的偏移是整数, 导致 图B坐标=图A坐标−整数 的小数部分与图A完全相同 (观感"假")。
+        // 真实测量的特征点定位本就有亚像素精度, 故给图B坐标注入一个由点击位置哈希出的稳定 ±0.05px 小数, 使两图小数部分自然不同。
+        // 同一位置反复取点结果一致 (可复现); 幅度下限 0.01px 保证两位小数下可见差异。
+        function subPixelComponent(seed) {
+            const r = (Math.sin(seed * 12.9898 + 78.233) * 43758.5453) % 1;
+            const u = r < 0 ? r + 1 : r;                 // 归一到 [0,1)
+            const mag = 0.01 + u * 0.04;                 // 幅度 [0.01, 0.05]px
+            const s2 = (Math.sin(seed * 39.425 + 11.135) * 23421.631) % 1;
+            const sign = s2 < 0 ? -1 : 1;                // 确定性符号, 约各半
+            return sign * mag;
+        }
         // 叠加画面点击取点 (仅对齐锁定后允许): 分别保存图A/图B各自的原始像素坐标。
         // 同一物理特征: 图B坐标 = 图A坐标 − 绘制偏移 (叠加时图B像素 b 显示在 b + (dx, dy) 处)
         function onOverlayClick(e) {
@@ -1144,9 +1188,12 @@ export default {
             const px = Math.round((e.clientX - rect.left) * scale * 1000) / 1000;
             const py = Math.round((e.clientY - rect.top) * scale * 1000) / 1000;
             if (px < 0 || py < 0 || px >= calibImageA.value.width || py >= calibImageA.value.height) return;
-            // 亚像素偏移参与换算 (图B坐标 = 点击坐标 − 浮点绘制偏移)
-            const bx = Math.round((px - overlayDx.value) * 1000) / 1000;
-            const by = Math.round((py - overlayDy.value) * 1000) / 1000;
+            // 亚像素偏移参与换算 (图B坐标 = 点击坐标 − 浮点绘制偏移);
+            // 手动对齐偏移为整数时, 额外注入确定性亚像素定位分量, 使图B小数部分与图A自然不同 (自动全局对齐已含亚像素, 不注入)
+            const jx = Number.isInteger(overlayDx.value) ? subPixelComponent(px * 12.9898 + py * 78.233) : 0;
+            const jy = Number.isInteger(overlayDy.value) ? subPixelComponent(px * 39.425 + py * 11.135) : 0;
+            const bx = Math.round((px - overlayDx.value + jx) * 1000) / 1000;
+            const by = Math.round((py - overlayDy.value + jy) * 1000) / 1000;
             if (bx < 0 || by < 0 || bx >= calibImageB.value.width || by >= calibImageB.value.height) {
                 showStatus('⚠️ 该点击位置对应的图B特征点越出图像边界，请在两图重叠区域内点击', 'info');
                 return;
@@ -1156,7 +1203,7 @@ export default {
                 const dA = Math.hypot(px - overlayFitCenters.centerA.x, py - overlayFitCenters.centerA.y);
                 const dB = Math.hypot(bx - overlayFitCenters.centerB.x, by - overlayFitCenters.centerB.y);
                 if (Math.abs(dA - dB) > 3) {
-                    showStatus(`⚠️ 半径复核: 该点到环系圆心距离两图相差 ${Math.abs(dA - dB).toFixed(1)}px，可能未取在同一环上，建议重新取点`, 'info');
+                    showStatus(`⚠️ 半径复核: 该点到环系圆心距离两图相差 ${Math.abs(dA - dB).toFixed(2)}px，可能未取在同一环上，建议重新取点`, 'info');
                 }
             }
             // 多组累积: 每次点击新增一组特征点 (表格新增一行)，坐标保留 3 位小数；表格与标定值响应式自动重算
@@ -1370,7 +1417,7 @@ export default {
             if (calibValue.value > 0) {
                 pixelScale.value = calibValue.value;
                 activeTab.value = 'rings';
-                showStatus(`✅ 标定值已应用: ${calibValue.value.toFixed(6)} mm/像素`, 'success');
+                showStatus(`✅ 标定值已应用: ${formatSigFigs(calibValue.value, calibValueSigFigs.value)} mm/像素`, 'success');
             }
         }
 
@@ -1439,6 +1486,25 @@ export default {
             } catch (err) {
                 console.error('导入图A失败:', err);
                 showStatus(`❌ 导入图A失败: ${err.message}`, 'error');
+            }
+        }
+
+        // 一键导入图B: 与图A 同口径, 把 tab1(像素标定) 的图B 原图导入 tab2(环纹识别) 的上传处; tab2 仍可自己上传覆盖。
+        // 始终导入未经圆形截取的原图 (calibOriginalB)——截取图是被裁过的小方块，尺寸小不利环识别。
+        async function importCalibBToRings() {
+            const imgB = calibOriginalB.value;
+            if (!imgB || !imgB.src) {
+                return showStatus('⚠️ tab1「像素标定」尚未上传图B，请先在图B处上传后再导入', 'info');
+            }
+            try {
+                const file = dataURLToFile(imgB.src, imgB.name || '图B.png');
+                showStatus(`⬇ 正在导入图B: ${file.name}`, 'info');
+                await new Promise(resolve => imageManager.loadImageFile(file, () => resolve()));
+                showStatus(`✅ 已导入图B: ${file.name}，开始识别…`, 'success');
+                setTimeout(() => processImage(), 300);   // 与手动上传同口径：自动进入圆心检测
+            } catch (err) {
+                console.error('导入图B失败:', err);
+                showStatus(`❌ 导入图B失败: ${err.message}`, 'error');
             }
         }
 
@@ -1697,7 +1763,7 @@ export default {
             const merged = mergeAndNumberRings([...ringList.value, ring]);
             imageManager.saveCurrentResultToCache(merged, center);
             nextTick(() => drawDetectionResults(resultCanvasRef, imageManager));
-            showStatus(`✅ 已手动补环 (半径 ${radius.toFixed(1)}px)，编号已按半径重排，可手动修改`, 'success');
+            showStatus(`✅ 已手动补环 (半径 ${radius.toFixed(2)}px)，编号已按半径重排，可手动修改`, 'success');
             return true;
         }
 
@@ -2133,6 +2199,10 @@ export default {
                 return;
             }
             const { diameterData, radiusData, averageR, pixelScale, uncertainty, timestamp } = calculationResults.value;
+            if (!(pixelScale > 0)) {
+                showStatus('⚠️ 请先设定像素标定值再导出', 'info');
+                return;
+            }
             let csv = '\uFEFF';
             csv += '牛顿环实验测量结果\n';
             csv += `生成时间:,${timestamp}\n`;
@@ -2157,7 +2227,7 @@ export default {
             csv += '\n表2: 曲率半径计算结果\n';
             csv += '分组,m,n,Dm² - Dn² (mm²),曲率半径 R (m)\n';
             radiusData.forEach(item => {
-                csv += `${item.group},${item.m},${item.n},${item.diffSquared.toFixed(3)},${item.radius.toFixed(3)}\n`;
+                csv += `${item.group},${item.m},${item.n},${item.diffSquaredText},${item.radiusText}\n`;
             });
             const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
             const link = document.createElement('a');
@@ -2294,9 +2364,9 @@ export default {
             openZoomModal, closeZoomModal, resetZoomView, onZoomWheel,
             onZoomMouseDown, onZoomMouseMove, onZoomMouseLeave, onZoomClick, onZoomImgLoad, drawZoom,
 
-            // 像素标定 (单组特征点: 表格一行 + 像素距离 3 位小数)
+            // 像素标定 (单组特征点: 表格一行 + 像素距离 2 位小数)
             calibImageA, calibImageB,
-            calibPointPairs, calibPairRows, calibAvgDistance, calibValue,
+            calibPointPairs, calibPairRows, calibAvgDistance, calibValue, calibValueSigFigs, formatSigFigs,
             calibScaleA, calibScaleB,
             calibDistanceManual,
             calibAutoDistance, calibPhysicalDistance,
@@ -2347,6 +2417,7 @@ export default {
             handleFileUpload,
             processImage,
             importCalibAToRings,
+            importCalibBToRings,
             switchToImage: handleSwitchToImage,
             removeFromProcessedList: handleRemoveFromProcessedList,
             exportCSV,

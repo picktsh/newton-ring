@@ -24,8 +24,43 @@ export function calculateDiameterData(detectedRings, pixelScale) {
     }));
 }
 
-// 计算曲率半径 (使用逐差法，步长 m-n 可人工调节，默认 3)
-export function calculateRadiusData(detectedRings, pixelScale, step = 3) {
+// 逐差法「平方差」列 (Dm²−Dn²) 应保留的小数位: 按误差传播定小数位。
+// 直径 D 显示/精确到 0.001mm (末位 1 个单位), 其平方的绝对精度 ≈ 2·D·0.001;
+// 减法按小数位数对齐 → 取 Dm²、Dn² 中较少的小数位 (即较大直径对应的位数);
+// 将该绝对精度修约到 1 位有效数字后, 其末位所在小数位即为平方差应保留的小数位。
+function squareDiffDecimals(Dm, Dn) {
+    const maxD = Math.max(Math.abs(Dm), Math.abs(Dn));
+    const p = 2 * maxD * 0.001;               // 平方项绝对精度 (直径末位 0.001mm 传播)
+    if (!isFinite(p) || p <= 0) return 3;
+    let exp = Math.floor(Math.log10(p));      // p = lead × 10^exp
+    let lead = Math.round(p / Math.pow(10, exp));
+    if (lead >= 10) { lead = 1; exp += 1; }   // 修约到 1 位有效数字 (逢十进位跨数量级)
+    return Math.max(0, -exp);                 // 末位所在小数位
+}
+
+// 有效数字计数 (与 app.js 同口径): 先按 decimals 位小数修约表示, 去小数点与前导零后数位数 (含末尾零)
+function countSigFigs(num, decimals) {
+    if (!isFinite(num) || num === 0) return 0;
+    const digits = Math.abs(num).toFixed(decimals).replace('.', '').replace(/^0+/, '');
+    return digits.length;
+}
+// 按有效数字修约并用四舍六入五成双格式化为普通小数字符串。
+// decimals = sig − 整数位数; 修约后若进位跨数量级 (如 9.9995→10.00) 则按新数量级重算一次, 保证恰好 sig 位有效数字。
+function formatSigFigsHalfEven(num, sig) {
+    if (!isFinite(num) || num === 0 || sig <= 0) return '0';
+    let d = Math.floor(Math.log10(Math.abs(num))) + 1;   // 整数位数
+    let decimals = Math.max(0, sig - d);
+    let text = roundHalfEven(num, decimals);
+    const d2 = Math.floor(Math.log10(Math.abs(Number(text)))) + 1;
+    if (d2 !== d) {                                      // 进位跨位: 按新数量级重修约
+        decimals = Math.max(0, sig - d2);
+        text = roundHalfEven(num, decimals);
+    }
+    return text;
+}
+
+// 计算曲率半径 (使用逐差法，步长 m-n 可人工调节，默认 5)
+export function calculateRadiusData(detectedRings, pixelScale, step = 5) {
     if (!detectedRings || detectedRings.length === 0) {
         return [];
     }
@@ -47,6 +82,15 @@ export function calculateRadiusData(detectedRings, pixelScale, step = 3) {
             // R = (Dm² - Dn²) / [4(m-n)λ]
             const diffSquared = Math.pow(Dm, 2) - Math.pow(Dn, 2);
             const R = (diffSquared * 1e-6) / (4 * (group.m - group.n) * LAMBDA);
+            // 平方差按误差传播定小数位, 中间量 diffSquared 保留全精度 (多于"多保留 1 位"),
+            // 最终显示用四舍六入五成双修约到该小数位 (diffSquaredText)
+            const diffSqDecimals = squareDiffDecimals(Dm, Dn);
+            // 本组 R 有效数字 = 本组差值 (按显示修约值) 的有效数字; 减法会损失有效数字, 各组位数可不同。
+            // R 由全精度 diffSquared 算出 (中间多保留), 每组完成减法后单独修约一次 (四舍六入五成双)。
+            const radiusSigFigs = countSigFigs(diffSquared, diffSqDecimals);
+            const radiusValid = diffSquared > 0 && isFinite(R) && R > 0 && radiusSigFigs > 0;
+            const radiusText = radiusValid ? formatSigFigsHalfEven(R, radiusSigFigs) : '—';
+            const radiusRounded = radiusValid ? Number(radiusText) : R;
 
             results.push({
                 group: `D${group.m} 与 D${group.n}`,
@@ -55,7 +99,12 @@ export function calculateRadiusData(detectedRings, pixelScale, step = 3) {
                 Dm,
                 Dn,
                 diffSquared,
-                radius: R
+                diffSqDecimals,
+                diffSquaredText: roundHalfEven(diffSquared, diffSqDecimals),
+                radius: R,                 // 全精度 (仅内部参考, 不显示)
+                radiusSigFigs,
+                radiusRounded,             // 修约后数值: 供 R̄ 与不确定度统计使用
+                radiusText                 // 修约后字符串: 表2 与 CSV 显示
             });
             totalRadius += R;
             validGroups++;
@@ -65,8 +114,8 @@ export function calculateRadiusData(detectedRings, pixelScale, step = 3) {
     return results;
 }
 
-// 动态生成分组配置 (步长可调，默认 3)
-function generateDynamicGroups(maxRingNumber, step = 3) {
+// 动态生成分组配置 (步长可调，默认 5)
+function generateDynamicGroups(maxRingNumber, step = 5) {
     if (maxRingNumber < step + 1) {
         return [];
     }
@@ -82,12 +131,12 @@ function generateDynamicGroups(maxRingNumber, step = 3) {
     return groups;
 }
 
-// 计算平均曲率半径
+// 计算平均曲率半径 (用各组修约后的 R, 与表2 显示值一致: "拿计算器按表里数字求平均"逐位吻合)
 export function calculateAverageRadius(radiusData) {
     if (!radiusData || radiusData.length === 0) {
         return 0;
     }
-    const total = radiusData.reduce((sum, item) => sum + item.radius, 0);
+    const total = radiusData.reduce((sum, item) => sum + (item.radiusRounded ?? item.radius), 0);
     return total / radiusData.length;
 }
 
@@ -151,7 +200,7 @@ export function calculateRadiusUncertainty(radiusData, averageRadius, pixelScale
         .map(it => {
             const Dm = it.Dm || 0, Dn = it.Dn || 0;
             const rel = (2 * uBD / it.diffSquared) * Math.sqrt(Dm * Dm + Dn * Dn);
-            return { group: it.group, m: it.m, n: it.n, Dm, Dn, diffSq: it.diffSquared, rel, uBR: it.radius * rel };
+            return { group: it.group, m: it.m, n: it.n, Dm, Dn, diffSq: it.diffSquared, rel, uBR: (it.radiusRounded ?? it.radius) * rel };
         });
     const uBRel = perGroup.length ? perGroup.reduce((a, g) => a + g.rel, 0) / perGroup.length : 0;
     const uB = averageRadius * uBRel;                          // u_B(R) = R̄·(u_B(R)/R)
@@ -159,7 +208,7 @@ export function calculateRadiusUncertainty(radiusData, averageRadius, pixelScale
     // 3. A 类不确定度 (多组 R_i): u_A(R̄) = √[Σ(R_i−R̄)²/(k(k−1))], 自由度 ν_A = k−1
     let s = 0, uA = 0, sumSqDev = 0, nuA = 0;
     if (k >= 2) {
-        sumSqDev = radiusData.reduce((sum, it) => sum + Math.pow(it.radius - averageRadius, 2), 0);
+        sumSqDev = radiusData.reduce((sum, it) => sum + Math.pow((it.radiusRounded ?? it.radius) - averageRadius, 2), 0);
         uA = Math.sqrt(sumSqDev / (k * (k - 1)));
         s = Math.sqrt(sumSqDev / (k - 1));
         nuA = k - 1;

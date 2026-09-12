@@ -157,6 +157,19 @@
     </svg>
 </head>
 <body>
+    <!-- 入口动态密码软锁 (纯前端, 防君子): 遮罩盖住整个应用, 由 js/access-lock.js 校验; 已解锁(sessionStorage)或校验通过则移除遮罩 -->
+    <div id="access-lock-overlay" style="position: fixed; inset: 0; z-index: 99999; display: flex; align-items: center; justify-content: center; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); font-family: 'Microsoft YaHei', Arial, sans-serif; transition: opacity 0.4s ease;">
+        <div id="access-lock-card" style="background: #fff; border-radius: 16px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); padding: 36px 32px; width: 320px; max-width: 90vw; text-align: center; box-sizing: border-box;">
+            <div style="font-size: 40px; line-height: 1;">🔒</div>
+            <h1 style="font-size: 20px; color: #333; margin: 14px 0 6px;">访问验证</h1>
+            <p style="font-size: 13px; color: #888; margin-bottom: 20px;">请输入 8 位访问密码</p>
+            <input id="access-lock-input" type="text" inputmode="numeric" autocomplete="off" maxlength="8" placeholder="••••••••"
+                   style="width: 100%; padding: 12px; font-size: 22px; letter-spacing: 6px; text-align: center; border: 2px solid #ddd; border-radius: 8px; outline: none; box-sizing: border-box;">
+            <div id="access-lock-error" style="min-height: 20px; margin-top: 10px; font-size: 13px; color: #e74c3c; visibility: hidden;">密码错误，请重试</div>
+            <button id="access-lock-btn" style="width: 100%; margin-top: 6px; padding: 12px; font-size: 16px; font-weight: bold; color: #fff; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border: none; border-radius: 8px; cursor: pointer;">进入</button>
+        </div>
+    </div>
+    <script src="js/access-lock.js"></script>
     <div id="app" v-cloak>
         <div class="container">
             <!-- Header -->
@@ -176,12 +189,15 @@
 
             <!-- Tab 2: 环纹识别与人机校验 -->
             <div class="content" v-show="activeTab === 'rings'">
-                <!-- 一键导入图A: 把 tab1(像素标定) 上传的图A 原图导入本页上传处, 免去重复上传; 本页仍可自己上传 -->
+                <!-- 一键导入图A/图B: 把 tab1(像素标定) 上传的图A或图B 原图导入本页上传处, 免去重复上传; 本页仍可自己上传 -->
                 <div class="card" style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap;">
                     <button class="btn" style="width: auto; margin: 0; padding: 8px 18px; background: linear-gradient(135deg, #16a085, #1abc9c);" :disabled="!calibOriginalA || isProcessing" @click="importCalibAToRings" title="把 tab1「像素标定」上传的图A 原图导入到本页并自动开始识别; 仍可点右侧「原始图像」框自行上传">
                         ⬇ 一键导入图A (取自像素标定板块)
                     </button>
-                    <span style="font-size: 12px; color: #999;">导入 tab1「像素标定」的图A 原图并自动开始识别；也可点右侧「原始图像」框自行上传</span>
+                    <button class="btn" style="width: auto; margin: 0; padding: 8px 18px; background: linear-gradient(135deg, #667eea, #764ba2);" :disabled="!calibOriginalB || isProcessing" @click="importCalibBToRings" title="把 tab1「像素标定」上传的图B 原图导入到本页并自动开始识别; 仍可点右侧「原始图像」框自行上传">
+                        ⬇ 一键导入图B (取自像素标定板块)
+                    </button>
+                    <span style="font-size: 12px; color: #999;">导入 tab1「像素标定」的图A / 图B 原图并自动开始识别；也可点右侧「原始图像」框自行上传</span>
                 </div>
                 <!-- Image Thumbnails -->
                 <div class="processed-images-list card" v-if="processedImages.length > 0">
@@ -292,7 +308,7 @@
                     <!-- 底部读数栏: 原图坐标与半径 (补环只取决于这个半径，切向点偏不影响结果) -->
                     <div style="flex: 0 0 auto; padding: 6px 14px; background: #1e1e1e; color: #ccc; font-size: 12px; min-height: 30px;">
                         <span v-if="zoomCursor && zoomCursor.inside">
-                            原图坐标 ({{ zoomCursor.x.toFixed(1) }}, {{ zoomCursor.y.toFixed(1) }}) · 半径 r = <b style="color: #4ec9ff;">{{ zoomCursor.r.toFixed(1) }}</b> px · 点击即在此半径补一个环
+                            原图坐标 ({{ zoomCursor.x.toFixed(2) }}, {{ zoomCursor.y.toFixed(2) }}) · 半径 r = <b style="color: #4ec9ff;">{{ zoomCursor.r.toFixed(2) }}</b> px · 点击即在此半径补一个环
                             <span v-if="zoomHoveredRing"> · 指针正压在 <b>环 {{ zoomHoveredRing }}</b> 上</span>
                         </span>
                         <span v-else-if="zoomCursor" style="color: #e67e22;">指针在图像范围外，此处点击不会补环</span>
@@ -389,9 +405,10 @@
                             v-model.number="pixelScale"
                             step="0.0001"
                             min="0.0001"
+                            placeholder="未设定，请从像素标定应用或手动输入"
                         >
                         <small style="color: #666; display: block; margin-top: 5px;">
-                            默认: 1像素 = 0.005毫米
+                            请先在 tab1「像素标定」标定后点『应用此标定值』，或在此手动输入
                         </small>
                     </div>
                     <!-- 处理按钮 -->
@@ -444,7 +461,7 @@
                                         <span v-if="item.manual" title="手动补入" style="color: #f39c12;">✍</span>
                                     </td>
                                     <td>{{ (ringRadius(item) * 2).toFixed(2) }}</td>
-                                    <td>{{ (ringRadius(item) * 2 * pixelScale).toFixed(3) }}</td>
+                                    <td>{{ pixelScale > 0 ? (ringRadius(item) * 2 * pixelScale).toFixed(3) : '—' }}</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -452,12 +469,12 @@
 
                     <!-- Radius Table -->
                     <h3 style="margin: 20px 0 10px 0; color: #555;">表2: 曲率半径计算结果</h3>
-                    <!-- 逐差法步长设置 (m-n)，默认 3，可人工修改，会话内保留 -->
+                    <!-- 逐差法步长设置 (m-n)，默认 5，可人工修改，会话内保留 -->
                     <div class="card" style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 12px 16px; margin-bottom: 10px;">
                         <label style="font-weight: bold; color: #333;">逐差法步长 (m−n):</label>
                         <input type="number" min="1" step="1" v-model.number="diffStep" @change="onDiffStepChange"
-                               title="分组为 D_m 与 D_{m-步长}，默认 3" style="width: 80px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; text-align: center;">
-                        <span style="font-size: 12px; color: #999;">默认 3，可人工修改；分组为 D<sub>m</sub> 与 D<sub>m−步长</sub>，修改后表2 与平均曲率半径自动重算</span>
+                               title="分组为 D_m 与 D_{m-步长}，默认 5" style="width: 80px; padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; text-align: center;">
+                        <span style="font-size: 12px; color: #999;">默认 5，可人工修改；分组为 D<sub>m</sub> 与 D<sub>m−步长</sub>，修改后表2 与平均曲率半径自动重算</span>
                     </div>
                     <div class="table-container card">
                         <table>
@@ -468,8 +485,8 @@
                                     <td>{{ item.group }}</td>
                                     <td>{{ item.m }}</td>
                                     <td>{{ item.n }}</td>
-                                    <td>{{ item.diffSquared.toFixed(3) }}</td>
-                                    <td>{{ item.radius.toFixed(3) }}</td>
+                                    <td>{{ item.diffSquaredText }}</td>
+                                    <td>{{ item.radiusText }}</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -561,7 +578,7 @@
                     <p style="font-size: 13px; color: #666; line-height: 1.6;">
                         通过转动测微鼓轮，先后拍摄两张显微镜视野图片。上传后先在图A上框选圆形截取区 (红圈=实际剪下的区域，两图用完全相同的位置截取)，
                         确认后下方的对齐重叠就只用这块截取区域 (画面按圆形显示，不自动重合)，再拖滑块手动对齐；也可跳过截取直接对齐全图。
-                        再在叠加画面上点击同一特征点，系统计算像素距离 (保留 3 位小数)。
+                        再在叠加画面上点击同一特征点，系统计算像素距离 (保留 2 位小数)。
                         输入鼓轮实际移动的物理距离，即可算出标定值（mm/像素）。
                     </p>
                 </div>
@@ -825,7 +842,7 @@
                 <div class="card" v-if="calibImageA || calibImageB">
                     <h3 style="color: #333; margin-bottom: 15px;">
                         📊 测量结果
-                        <span style="font-size: 12px; color: #999; margin-left: 10px;">锁定对齐后，在叠加画面上点击特征点手动取点 (每次点击新增一组一行)</span>
+                        <span style="font-size: 12px; color: #999; margin-left: 10px;">锁定对齐后，在叠加画面上点击特征点手动取点 (每次点击新增一组一行)；图B坐标含亚像素定位分量</span>
                     </h3>
 
                     <!-- 特征点表格 (多组模式，每组一行) -->
@@ -850,12 +867,12 @@
                             </tr>
                             <tr v-for="row in calibPairRows" :key="row.id">
                                 <td style="padding: 6px 8px; border: 1px solid #eee; text-align: center; font-weight: bold; color: #e74c3c;">{{ row.id + 1 }}</td>
-                                <td style="padding: 6px 8px; border: 1px solid #eee; text-align: center; font-family: monospace; font-size: 12px;">({{ row.ax.toFixed(3) }}, {{ row.ay.toFixed(3) }})</td>
-                                <td style="padding: 6px 8px; border: 1px solid #eee; text-align: center; font-family: monospace; font-size: 12px;">({{ row.bx.toFixed(3) }}, {{ row.by.toFixed(3) }})</td>
-                                <td style="padding: 6px 8px; border: 1px solid #eee; text-align: center; font-family: monospace;">{{ row.dx.toFixed(3) }}</td>
-                                <td style="padding: 6px 8px; border: 1px solid #eee; text-align: center; font-family: monospace;">{{ row.dy.toFixed(3) }}</td>
-                                <td style="padding: 6px 8px; border: 1px solid #eee; text-align: center; font-family: monospace; font-weight: bold; color: #e74c3c;">{{ row.dist.toFixed(3) }}</td>
-                                <td style="padding: 6px 8px; border: 1px solid #eee; text-align: center; font-family: monospace; color: #27ae60;">{{ row.value > 0 ? row.value.toFixed(6) : '—' }}</td>
+                                <td style="padding: 6px 8px; border: 1px solid #eee; text-align: center; font-family: monospace; font-size: 12px;">({{ row.ax.toFixed(2) }}, {{ row.ay.toFixed(2) }})</td>
+                                <td style="padding: 6px 8px; border: 1px solid #eee; text-align: center; font-family: monospace; font-size: 12px;">({{ row.bx.toFixed(2) }}, {{ row.by.toFixed(2) }})</td>
+                                <td style="padding: 6px 8px; border: 1px solid #eee; text-align: center; font-family: monospace;">{{ row.dx.toFixed(2) }}</td>
+                                <td style="padding: 6px 8px; border: 1px solid #eee; text-align: center; font-family: monospace;">{{ row.dy.toFixed(2) }}</td>
+                                <td style="padding: 6px 8px; border: 1px solid #eee; text-align: center; font-family: monospace; font-weight: bold; color: #e74c3c;">{{ row.dist.toFixed(2) }}</td>
+                                <td style="padding: 6px 8px; border: 1px solid #eee; text-align: center; font-family: monospace; color: #27ae60;">{{ row.value > 0 ? formatSigFigs(row.value, row.sigFigs) : '—' }}</td>
                                 <td style="padding: 6px 8px; border: 1px solid #eee; text-align: center;">
                                     <button class="calibration-upload-btn" style="background: #e74c3c; padding: 3px 8px; font-size: 11px;" @click="removeCalibPair(row.id)">删除</button>
                                 </td>
@@ -867,7 +884,7 @@
                     <div style="display: flex; align-items: center; gap: 15px; margin-top: 12px; flex-wrap: wrap;">
                         <div class="calibration-metric" style="border-left-color: #e74c3c;">
                             <label>像素距离 (px)</label>
-                            <div class="value" style="color: #e74c3c;">{{ calibAvgDistance > 0 ? calibAvgDistance.toFixed(3) : '—' }}</div>
+                            <div class="value" style="color: #e74c3c;">{{ calibAvgDistance > 0 ? calibAvgDistance.toFixed(2) : '—' }}</div>
                         </div>
                         <button v-if="calibPairRows.length" class="calibration-upload-btn" style="background: #95a5a6;" @click="clearCalibPairs">🗑️ 清空特征点</button>
                     </div>
@@ -886,10 +903,10 @@
                     <div class="calibration-metric" style="margin-top: 15px; border-left-color: #27ae60; background: #eafaf1;">
                         <label>标定值 (mm/像素) = 物理距离 ÷ 像素距离</label>
                         <div class="value" style="color: #27ae60; font-size: 22px;">
-                            {{ calibValue > 0 ? calibValue.toFixed(6) : '—' }}
+                            {{ calibValue > 0 ? formatSigFigs(calibValue, calibValueSigFigs) : '—' }}
                         </div>
                         <small style="color: #666; margin-top: 5px; display: block;">
-                            {{ calibValue > 0 ? `即 1像素 = ${calibValue.toFixed(6)} mm` : (calibPairRows.length ? '请输入物理距离以计算标定值' : '请先在叠加画面上取点') }}
+                            {{ calibValue > 0 ? `即 1像素 = ${formatSigFigs(calibValue, calibValueSigFigs)} mm` : (calibPairRows.length ? '请输入物理距离以计算标定值' : '请先在叠加画面上取点') }}
                         </small>
                     </div>
 
